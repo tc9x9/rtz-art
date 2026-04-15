@@ -2036,16 +2036,68 @@ export default function App() {
       }}
     >
       <div style={{ maxWidth: 1180, margin: "0 auto" }}>
-        <div style={{ marginBottom: 20 }}>
-          <div style={{ fontSize: 11, color: "#8b7cf6", letterSpacing: "0.12em", textTransform: "uppercase", marginBottom: 6 }}>
-            RTZ Auction Lab
+        <div
+          style={{
+            marginBottom: 16,
+            display: "grid",
+            gridTemplateColumns: "minmax(0,1fr) minmax(280px,360px)",
+            gap: 14,
+            alignItems: "start",
+          }}
+        >
+          <div>
+            <div style={{ fontSize: 11, color: "#8b7cf6", letterSpacing: "0.12em", textTransform: "uppercase", marginBottom: 6 }}>
+              RTZ Auction Lab
+            </div>
+            <h1 style={{ fontSize: 30, lineHeight: 1.15, margin: 0 }}>
+              Rebuild: legacy baseline, validated simulator, v2.0 redesign
+            </h1>
+            <div style={{ marginTop: 8, color: "#9b9ba6", maxWidth: 760, lineHeight: 1.65 }}>
+              Jedna aplikacja do trzech zadań: zrekonstruować punkt startowy v1.0, zbudować poprawny symulator v1.1 oraz
+              uruchomić redesign mechanizmu v2.0 na adaptacyjnych agentach z replikacjami, walidacją i eksportem wyników.
+            </div>
           </div>
-          <h1 style={{ fontSize: 30, lineHeight: 1.15, margin: 0 }}>
-            Rebuild: legacy baseline, validated simulator, v2.0 redesign
-          </h1>
-          <div style={{ marginTop: 8, color: "#9b9ba6", maxWidth: 900, lineHeight: 1.65 }}>
-            Jedna aplikacja do trzech zadań: zrekonstruować punkt startowy v1.0, zbudować poprawny symulator v1.1 oraz
-            uruchomić redesign mechanizmu v2.0 na adaptacyjnych agentach z replikacjami, walidacją i eksportem wyników.
+          <div
+            style={{
+              background: "#15151b",
+              border: "1px solid #2c2c35",
+              borderRadius: 8,
+              padding: 12,
+              display: "grid",
+              gap: 8,
+            }}
+          >
+            <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "center" }}>
+              <div>
+                <div style={{ fontSize: 10, color: "#8b7cf6", letterSpacing: "0.08em", textTransform: "uppercase", fontWeight: 800 }}>
+                  Szybkie akcje
+                </div>
+                <div style={{ fontSize: 11, color: "#9b9ba6", marginTop: 2 }}>
+                  {estimatedEvaluations} ewaluacji, reps={reps}
+                </div>
+              </div>
+              <StatusPill ok={!busy} text={busy ? "running" : "ready"} />
+            </div>
+            <button style={{ ...btnPrimary, padding: 11, opacity: busy ? 0.7 : 1 }} disabled={busy} onClick={() => handleRun()}>
+              {busy ? "Trwa uruchomienie..." : "Uruchom eksperyment"}
+            </button>
+            <div style={{ display: "grid", gridTemplateColumns: autoMode ? "1fr 1fr" : "1fr", gap: 8 }}>
+              <button
+                style={{ ...btnSecondary, borderColor: "#2ecc71", color: "#fff", opacity: busy ? 0.7 : 1 }}
+                disabled={busy}
+                onClick={handleStartAutopilot}
+              >
+                Autopilot: {autoRunLimit}
+              </button>
+              {autoMode ? (
+                <button style={{ ...btnSecondary, borderColor: "#f0a030", color: "#fff" }} onClick={handleStopAuto}>
+                  Stop
+                </button>
+              ) : null}
+            </div>
+            <div style={{ fontSize: 11, color: "#bdbdc6", lineHeight: 1.45, minHeight: 30 }}>
+              {phase}
+            </div>
           </div>
         </div>
 
@@ -2074,22 +2126,6 @@ export default function App() {
             </Box>
 
             <ParameterHints />
-
-            <button style={{ ...btnPrimary, opacity: busy ? 0.7 : 1 }} disabled={busy} onClick={() => handleRun()}>
-              {busy ? "Trwa przebudowa i uruchomienie..." : "Przebuduj rozwiązanie i uruchom"}
-            </button>
-            <button
-              style={{ ...btnSecondary, borderColor: "#2ecc71", color: "#fff", opacity: busy ? 0.7 : 1 }}
-              disabled={busy}
-              onClick={handleStartAutopilot}
-            >
-              Start autopilota badawczego: {autoRunLimit} przebiegów
-            </button>
-            {autoMode ? (
-              <button style={{ ...btnSecondary, borderColor: "#f0a030", color: "#fff" }} onClick={handleStopAuto}>
-                Zatrzymaj autopilot
-              </button>
-            ) : null}
 
             <Box accent={busy ? "#8b7cf640" : "#33333b"}>
               <Label>Status</Label>
