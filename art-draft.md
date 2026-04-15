@@ -16,9 +16,9 @@ Wersja robocza — kwiecień 2026
 
 Platformy obrotu frakcjonalizowanymi prawami autorskimi do katalogów muzycznych stanowią nowy segment inwestycji alternatywnych, w którym projektowanie mechanizmu aukcyjnego pozostaje problemem otwartym. Niniejszy artykuł przedstawia metodę optymalizacji zmodyfikowanej aukcji holenderskiej, w której obiekt aukcji jest podzielny na $S$ frakcji, a licytanci składają oferty dwuwymiarowe (cena maksymalna za frakcję, budżet). Proponujemy architekturę *simulation-in-the-loop*, w której adaptacyjni agenci — trenowani metodą $\varepsilon$-greedy z aktualizacją wartości typu bandit w dyskretnej przestrzeni 45 strategii — pełnią rolę syntetycznych uczestników rynku, a trójfazowa procedura przeszukiwania (eksploracja losowa, mutacje elitarne, moduł Bayesian-lite inspirowany TPE) przeszukuje przestrzeń parametrów mechanizmu w celu maksymalizacji wielokryterialnej funkcji jakości.
 
-Badanie wyróżnia trzy warianty mechanizmu. Wariant RTZ v1.0 odtwarza logikę historycznej implementacji Python/Django, w tym ułamkowy popyt i dwufazowy clearing. Wariant RTZ v1.1 stanowi walidowany punkt odniesienia: wprowadza budżetowo wykonalną alokację, poprawiony clearing zapamiętujący ostatnią cenę z popytem $\ge S$ oraz minimalną granularność $S \ge 1\,000$. Wariant RTZ v2.0 jest kandydatem projektowym uzyskanym przez przeszukiwanie przestrzeni pięciu parametrów mechanizmu.
+Badanie wyróżnia cztery poziomy mechanizmu. Wariant RTZ v1.0 odtwarza logikę historycznej implementacji Python/Django, w tym ułamkowy popyt i dwufazowy clearing. Wariant RTZ v1.1 stanowi walidowany punkt odniesienia: wprowadza budżetowo wykonalną alokację, poprawiony clearing zapamiętujący ostatnią cenę z popytem $\ge S$ oraz minimalną granularność $S \ge 1\,000$. Wariant RTZ v2.0 pełni rolę diagnostycznego wariantu trade-offowego uzyskanego przez przeszukiwanie przestrzeni pięciu parametrów mechanizmu. Wariant RTZ v2.1 wprowadza selekcję revenue-gated: rekomendowany mechanizm jest wybierany wyłącznie spośród kandydatów spełniających $RR \ge 0{,}90$, natomiast najlepszy trade-off pozostaje raportowany osobno jako diagnostyka.
 
-Wynikiem jest zoptymalizowana konfiguracja mechanizmu aukcyjnego, obejmująca regułę alokacji frakcji, strategię ustalania ceny minimalnej, typ kroku cenowego oraz ograniczenie koncentracji — wraz z mierzalną poprawą względem mechanizmu bazowego na pięciu metrykach: przychód sprzedającego (Revenue Ratio), efektywność alokacji (Allocative Efficiency), odporność na manipulację (Exploitation Gap), wskaźnik sukcesu aukcji (Completion Rate) i sprawiedliwość dostępu (market-only Fairness Index). Rozróżnienie między Fairness Index (obliczanym wyłącznie na segmentach rynkowych) a Exploitation Gap (uwzględniającym agentów diagnostycznych Red Team) pozwala oddzielić sprawiedliwość udziału od odporności mechanizmu na strategie exploitacyjne.
+Wynikiem jest algorytm wyboru konfiguracji mechanizmu aukcyjnego, obejmujący regułę alokacji frakcji, strategię ustalania ceny minimalnej, typ kroku cenowego oraz ograniczenie koncentracji. Kluczową zmianą v2.1 jest rozdzielenie rekomendacji mechanizmu (*best feasible*) od diagnostyki kompromisu (*best trade-off*). Mechanizm rekomendowany musi utrzymać przychód sprzedającego (Revenue Ratio), a dopiero następnie jest oceniany przez efektywność alokacji (Allocative Efficiency), odporność na manipulację (Exploitation Gap), wskaźnik sukcesu aukcji (Completion Rate) i sprawiedliwość dostępu (market-only Fairness Index). Rozróżnienie między Fairness Index (obliczanym wyłącznie na segmentach rynkowych) a Exploitation Gap (uwzględniającym agentów diagnostycznych Red Team) pozwala oddzielić sprawiedliwość udziału od odporności mechanizmu na strategie exploitacyjne.
 
 **Słowa kluczowe:** aukcja holenderska, frakcjonalizacja praw autorskich, simulation-in-the-loop, automated mechanism redesign, agenci adaptacyjni, fairness-aware selection, market-only fairness, exploitation diagnostics
 
@@ -231,9 +231,31 @@ $$
 
 gdzie $h$ oznacza liczbę spełnionych progów metrycznych (od 0 do 5). Konfiguracja jest uznawana za *fairness-preferred* tylko wtedy, gdy jednocześnie spełnia $RR \ge 0{,}90$, $FI \ge 0{,}60$ oraz $EG \le 0{,}15$. Warunek przychodowy jest kluczowy: bez niego mechanizm mógłby poprawiać sprawiedliwość dostępu kosztem zbyt dużej utraty przychodu.
 
-### 4.4.2. Ranking konfiguracji
+### 4.4.2. Ranking konfiguracji: best feasible i best trade-off
 
-Porównanie konfiguracji odbywa się wielopoziomowo: (1) konfiguracje fairness-preferred mają pierwszeństwo nad pozostałymi, (2) wśród fairness-preferred sortowanie według liczby spełnionych progów malejąco, (3) następnie według FI malejąco, (4) według EG rosnąco, (5) według wyniku selection malejąco. Dodatkowo obliczany jest front Pareto — zbiór konfiguracji niezdominowanych na pięciu metrykach — spośród którego projektant mechanizmu wybiera punkt odpowiadający priorytetom platformy.
+Wariant RTZ v2.0 wykorzystywany jest jako ranking diagnostyczny (*best trade-off*). Pozwala on pokazać, jakie wartości FI i EG można osiągnąć, jeżeli mechanizm dopuszcza silniejszy kompromis przychodowy. Nie jest jednak traktowany jako rekomendacja mechanizmu, jeżeli narusza barierę $RR \ge 0{,}90$.
+
+Wariant RTZ v2.1 wprowadza osobny ranking *best feasible*. Najpierw definiowany jest zbiór konfiguracji dopuszczalnych przychodowo:
+
+$$
+\Theta_{\mathrm{feasible}} = \{\theta \in \Theta : RR(\theta) \ge 0{,}90\}.
+$$
+
+Jeżeli $\Theta_{\mathrm{feasible}}$ jest niepusty, rekomendowana konfiguracja jest wybierana wyłącznie z tego zbioru:
+
+$$
+\theta^{\star}_{\mathrm{v2.1}} =
+\arg\max_{\theta \in \Theta_{\mathrm{feasible}}}
+\left[
+\mathrm{selection}(\theta)
+- \lambda_{\mathrm{adaptive}} \cdot
+\mathbb{1}_{\{\mathrm{step}(\theta)=\mathrm{adaptive}\}}
+\right],
+$$
+
+gdzie w obecnej implementacji $\lambda_{\mathrm{adaptive}} = 0{,}035$. Kara nie usuwa konfiguracji z krokiem adaptive z przestrzeni poszukiwań, lecz ogranicza ich preferencję w rankingu, ponieważ wcześniejsze przebiegi wskazały, że adaptive często zwiększa FI kosztem obniżenia RR. Jeśli zbiór $\Theta_{\mathrm{feasible}}$ jest pusty, aplikacja raportuje fallback: najlepszą znalezioną konfigurację według RR i selection, ale nie interpretuje jej jako mechanizmu fairness-preferred.
+
+Dodatkowo obliczany jest front Pareto — zbiór konfiguracji niezdominowanych na pięciu metrykach — oraz ranking best trade-off. Dzięki temu raport rozdziela dwie role: (1) rekomendację mechanizmu możliwego do obrony przychodowo oraz (2) diagnostykę kompromisów między przychodem, fairness i odpornością.
 
 ## 4.5. Procedura przeszukiwania mechanizmu
 
@@ -271,9 +293,9 @@ Poprawność symulatora jest weryfikowana zestawem siedmiu testów niezmiennikó
 
 ## 5.1. Eksperyment główny: przeszukiwanie przestrzeni mechanizmów
 
-Eksperyment główny porównuje trzy warianty mechanizmu: RTZ v1.0 (historyczny), RTZ v1.1 (walidowany) oraz RTZ v2.0 (przeprojektowany). Wariant v1.0 służy do kontroli zgodności z oryginalną implementacją. Wariant v1.1 stanowi właściwy punkt odniesienia, ponieważ usuwa artefakty budżetowe i clearingowe. Wariant v2.0 jest kandydatem projektowym uzyskanym przez trójfazowe przeszukiwanie przestrzeni parametrów.
+Eksperyment główny porównuje cztery poziomy mechanizmu: RTZ v1.0 (historyczny), RTZ v1.1 (walidowany), RTZ v2.0 (diagnostyczny best trade-off) oraz RTZ v2.1 (revenue-gated best feasible). Wariant v1.0 służy do kontroli zgodności z oryginalną implementacją. Wariant v1.1 stanowi właściwy punkt odniesienia, ponieważ usuwa artefakty budżetowe i clearingowe. Wariant v2.0 pokazuje potencjalny kompromis fairness/EG przy słabszym ograniczeniu przychodowym, natomiast wariant v2.1 jest kandydatem projektowym uzyskanym przez trójfazowe przeszukiwanie przestrzeni parametrów i selekcję z bramką $RR \ge 0{,}90$.
 
-Podstawowe pytanie eksperymentalne: *czy wariant v2.0 poprawia wynik ważony, sprawiedliwość dostępu i odporność na eksploatację względem v1.1, nie naruszając bariery przychodowej $RR \ge 0{,}90$?*
+Podstawowe pytanie eksperymentalne: *czy wariant v2.1 poprawia wynik ważony, sprawiedliwość dostępu i odporność na eksploatację względem v1.1, nie naruszając bariery przychodowej $RR \ge 0{,}90$?*
 
 Domyślna konfiguracja: $n_{\mathrm{agents}} = 30$, $V = 50\,000$ PLN, $T_{\mathrm{learn}} = 160$, $T_{\mathrm{eval}} = 80$, $\mathrm{reps} = 9$, $n_{\mathrm{explore}} = 10$, $n_{\mathrm{exploit}} = 14$, $n_{\mathrm{bayes}} = 6$.
 
@@ -333,7 +355,7 @@ Rozszerzenie o algorytmy policy gradient (SAC, PPO) z ciągłą przestrzenią ak
 
 ## 6.5. Wniosek 5: Krzywa uczenia jako narzędzie diagnostyczne stabilności mechanizmu
 
-Analiza wrażliwości na $T_{\mathrm{learn}}$ — porównująca delty metryk między v1.1 a v2.0 przy różnych długościach fazy uczenia — jest nie tylko testem robustności wyniku, lecz także narzędziem diagnostycznym. Jeżeli przewaga v2.0 rośnie z $T_{\mathrm{learn}}$, oznacza to, że mechanizm v2.0 jest bardziej odporny na długotrwałą adaptację agentów. Jeżeli maleje — mechanizm v2.0 jest podatny na strategiczną eksploatację przy dłuższym uczeniu.
+Analiza wrażliwości na $T_{\mathrm{learn}}$ — porównująca delty metryk między v1.1 a v2.1 przy różnych długościach fazy uczenia — jest nie tylko testem robustności wyniku, lecz także narzędziem diagnostycznym. Jeżeli przewaga v2.1 rośnie z $T_{\mathrm{learn}}$, oznacza to, że mechanizm v2.1 jest bardziej odporny na długotrwałą adaptację agentów. Jeżeli maleje — mechanizm v2.1 jest podatny na strategiczną eksploatację przy dłuższym uczeniu.
 
 Stabilna lub rosnąca delta selection score przy rosnącym $T_{\mathrm{learn}}$ jest silniejszym argumentem na rzecz redesignu niż sama poprawa wyniku ważonego, ponieważ wyklucza scenariusz, w którym poprawa wynika wyłącznie z niedostatecznej adaptacji agentów.
 
@@ -341,9 +363,9 @@ Stabilna lub rosnąca delta selection score przy rosnącym $T_{\mathrm{learn}}$ 
 
 Po zakończeniu procedury eksperymentalnej wyniki powinny zostać przedstawione w następującym układzie:
 
-| Metryka | RTZ v1.0 | RTZ v1.1 | RTZ v2.0 | Interpretacja |
+| Metryka | RTZ v1.0 | RTZ v1.1 | RTZ v2.1 best feasible | Interpretacja |
 |---|---:|---:|---:|---|
-| M1 Revenue Ratio | $\mu \pm \sigma$ | $\mu \pm \sigma$ | $\mu \pm \sigma$ | Czy v2.0 utrzymuje $RR \ge 0{,}90$? |
+| M1 Revenue Ratio | $\mu \pm \sigma$ | $\mu \pm \sigma$ | $\mu \pm \sigma$ | Czy v2.1 utrzymuje $RR \ge 0{,}90$? |
 | M2 Allocative Efficiency | $\mu \pm \sigma$ | $\mu \pm \sigma$ | $\mu \pm \sigma$ | Czy alokacja trafia do agentów o wyższej wartości prywatnej? |
 | M3 Exploitation Gap | $\mu \pm \sigma$ | $\mu \pm \sigma$ | $\mu \pm \sigma$ | Czy Red Team traci przewagę? |
 | M4 Completion Rate | $\mu \pm \sigma$ | $\mu \pm \sigma$ | $\mu \pm \sigma$ | Czy mechanizm sprzedaje pełne $S$ frakcji? |
@@ -351,7 +373,7 @@ Po zakończeniu procedury eksperymentalnej wyniki powinny zostać przedstawione 
 | Wynik ważony | $\mu \pm \sigma$ | $\mu \pm \sigma$ | $\mu \pm \sigma$ | Agregacja M1–M5. |
 | Fair-aware selection | $\mu \pm \sigma$ | $\mu \pm \sigma$ | $\mu \pm \sigma$ | Ranking z premią za FI, EG i liczbę spełnionych progów. |
 
-Interpretacja wyników powinna odnosić v2.0 przede wszystkim do RTZ v1.1, ponieważ v1.1 jest właściwym punktem odniesienia badania. Wariant v1.0 pozostaje punktem historycznym i testem rekonstrukcji oryginalnej logiki.
+Wyniki należy uzupełnić także o osobną informację diagnostyczną: najlepszy v2.0 trade-off, liczbę kandydatów spełniających $RR \ge 0{,}90$ oraz informację, czy v2.1 użył fallbacku z powodu braku konfiguracji przychodowo dopuszczalnej. Interpretacja wyników powinna odnosić v2.1 przede wszystkim do RTZ v1.1, ponieważ v1.1 jest właściwym punktem odniesienia badania. Wariant v1.0 pozostaje punktem historycznym i testem rekonstrukcji oryginalnej logiki.
 
 # 7. Dyskusja
 
@@ -385,7 +407,9 @@ Dalsze badania mogą również porównać RTZ z alternatywnymi mechanizmami aukc
 
 Artykuł przedstawia metodę optymalizacji mechanizmu aukcji holenderskiej na frakcjonalizowane prawa autorskie z zastosowaniem symulacji wieloagentowej z agentami adaptacyjnymi. Architektura *simulation-in-the-loop*, łącząca trójfazowe przeszukiwanie mechanizmu (eksploracja, mutacje elitarne, Bayesian-lite/TPE) z populacją heterogenicznych agentów typu bandit, pozwala przeszukać przestrzeń pięciu parametrów projektowych mechanizmu i zidentyfikować konfigurację optymalną w sensie wielokryterialnym.
 
-Najważniejszym efektem obecnego etapu jest spójna rama badawcza, która oddziela trzy porządki: zgodność z oryginalną implementacją (RTZ v1.0), poprawność symulatora (RTZ v1.1) i jakość przeprojektowanego mechanizmu (RTZ v2.0). Wprowadzenie market-only Fairness Index i wyodrębnienie Exploitation Gap jako osobnej metryki diagnostycznej pozwala badać sprawiedliwość dostępu i odporność na manipulację niezależnie.
+Najważniejszym efektem obecnego etapu jest spójna rama badawcza, która oddziela cztery porządki: zgodność z oryginalną implementacją (RTZ v1.0), poprawność symulatora (RTZ v1.1), diagnostykę kompromisów projektowych (RTZ v2.0 best trade-off) oraz rekomendację mechanizmu z twardą bramką przychodową (RTZ v2.1 best feasible). Wprowadzenie market-only Fairness Index i wyodrębnienie Exploitation Gap jako osobnej metryki diagnostycznej pozwala badać sprawiedliwość dostępu i odporność na manipulację niezależnie.
+
+W sensie algorytmicznym uzyskano nie tylko pojedynczą konfigurację aukcji, lecz procedurę wyboru mechanizmu: kandydaci są generowani przez eksplorację, mutacje elit i Bayesian-lite/TPE, następnie pełnie ewaluowani w symulatorze, a rekomendacja v2.1 jest wybierana spośród konfiguracji spełniających $RR \ge 0{,}90$. Równoległe raportowanie best trade-off pozwala nadal analizować koszt przychodowy poprawy FI i EG, bez mieszania tej diagnostyki z rekomendacją wdrożeniową.
 
 Zastosowane uproszczenia — agenci typu bandit zamiast deep RL, heurystyczny TPE-lite zamiast pełnego BOHB, stylizowany model rynku zamiast kalibracji empirycznej — są adekwatne do celu badania: walidacji ramy eksperymentalnej i identyfikacji kierunków zmian w mechanizmie. Wynikiem jest zoptymalizowany mechanizm aukcyjny — konkretna konfiguracja algorytmu — wraz z mierzalną poprawą przychodu, efektywności, odporności na manipulację i sprawiedliwości dostępu.
 

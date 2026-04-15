@@ -1,11 +1,11 @@
 "use client";
 
-import React, { useCallback, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import experimentDefaults from "../config/experiment-defaults.json";
 
 // =========================
 // RTZ Auction Lab
-// v1.0 legacy -> v1.1 validated -> v2.0 redesign
+// v1.0 legacy -> v1.1 validated -> v2.1 revenue-gated redesign
 // =========================
 
 const TYPE_ORDER = ["individual", "institutional", "speculator", "redteam"];
@@ -31,22 +31,22 @@ const METRIC_DETAILS = {
   rr: {
     formula: "RR = min(R ÷ V, 2),  R = ∑ᵢ cᵢ = ∑ᵢ p · sᵢ",
     target: "cel: RR ≥ 0.90",
-    help: "M1 mierzy przychód aukcji względem wartości fundamentalnej katalogu V. Wyżej jest lepiej, ale konfiguracje fairness-preferred muszą utrzymać co najmniej 90%.",
+    help: "M1 mierzy przychód aukcji względem wartości fundamentalnej katalogu V. Wyższa wartość jest korzystna, ale konfiguracje fairness-preferred muszą utrzymać co najmniej 90%.",
   },
   ae: {
     formula: "AE = PVᵣₑₐₗ ÷ PV*,  PVᵣₑₐₗ = ∑ᵢ sᵢ · pvᵢ",
     target: "cel: AE ≥ 0.70",
-    help: "M2 porównuje wartość prywatną faktycznej alokacji z najlepszą budżetowo wykonalną alokacją przy tej samej cenie. Wyżej jest lepiej.",
+    help: "M2 porównuje wartość prywatną faktycznej alokacji z najlepszą budżetowo wykonalną alokacją przy tej samej cenie. Wyższa wartość jest korzystna.",
   },
   eg: {
     formula: "EG = max((ROIᴿᵉᵈ − ROIᴵⁿᵈ) ÷ (|ROIᴿᵉᵈ| + |ROIᴵⁿᵈ| + 0.01), 0)",
     target: "cel: EG ≤ 0.15",
-    help: "M3 wykrywa przewagę Red Teamu nad uczestnikami indywidualnymi. Niżej jest lepiej; zero oznacza brak przewagi Red Teamu w ROI.",
+    help: "M3 wykrywa przewagę Red Teamu nad uczestnikami indywidualnymi. Niższa wartość jest korzystna; zero oznacza brak przewagi Red Teamu w ROI.",
   },
   cr: {
     formula: "CR = Nᶜˡᵉᵃʳᵉᵈₑᵥₐₗ ÷ Tₑᵥₐₗ",
     target: "cel: CR ≥ 0.85",
-    help: "M4 mierzy, jak często aukcja sprzedaje pełne S frakcji w rundach ewaluacji. Wyżej jest lepiej.",
+    help: "M4 mierzy, jak często aukcja sprzedaje pełne S frakcji w rundach ewaluacji. Wyższa wartość jest korzystna.",
   },
   fi: {
     formula: "FI = 1 − (∑ₜ |shareₜ − targetₜ|) ÷ Dₘₐₓ,  t ∈ {Ind, Inst, Spec}",
@@ -66,6 +66,8 @@ const METRIC_TARGETS = {
   cr: v => v >= 0.85,
   fi: v => v >= 0.6,
 };
+const REVENUE_GATE = 0.9;
+const ADAPTIVE_STEP_RISK_PENALTY = 0.035;
 const METRIC_DIRECTIONS = { rr: "max", ae: "max", eg: "min", cr: "max", fi: "max" };
 const PM = [0.4, 0.55, 0.7, 0.85, 0.95, 1.0, 1.1, 1.25, 1.5];
 const BF = [0.2, 0.4, 0.6, 0.8, 1.0];
@@ -74,7 +76,8 @@ const DESIGN_RULES = ["proportional", "priority", "equal", "hybrid"];
 const DESIGN_STEPS = ["linear", "exponential", "adaptive"];
 const DESIGN_FRACTIONS = [1000, 2500, 5000, 10000];
 const DEFAULT_AUTOPILOT_RUN_LIMIT = 7;
-const MAX_AUTOPILOT_RUN_LIMIT = 50;
+const MAX_AUTOPILOT_BATCH_LIMIT = 50;
+const SESSION_STORAGE_KEY = "rtz-auction-lab-autopilot-session-v2-1";
 const SEED_BASE_STEP = 1000003;
 const SEED_SEARCH_STEP = 104729;
 
@@ -118,6 +121,28 @@ function enforceGranularityPolicy(cfg) {
 
 function sleep(ms = 0) {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function readStoredSession() {
+  if (typeof window === "undefined") return null;
+  try {
+    const raw = window.sessionStorage.getItem(SESSION_STORAGE_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch (err) {
+    console.warn("Cannot read RTZ session storage", err);
+    return null;
+  }
+}
+
+function writeStoredSession(snapshot) {
+  if (typeof window === "undefined") return false;
+  try {
+    window.sessionStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(snapshot));
+    return true;
+  } catch (err) {
+    console.warn("Cannot persist RTZ session storage", err);
+    return false;
+  }
 }
 
 function mulberry32(seed = 123456789) {
@@ -169,7 +194,21 @@ function isFairnessPreferred(m) {
   return METRIC_TARGETS.rr(m.rr) && METRIC_TARGETS.fi(m.fi) && METRIC_TARGETS.eg(m.eg);
 }
 
-function compareEvaluations(a, b) {
+function isRevenueFeasible(m) {
+  return m.rr >= REVENUE_GATE;
+}
+
+function adaptiveStepPenalty(entry) {
+  if (entry.cfg?.stepType !== "adaptive") return 0;
+  const rrGap = Math.max(0, REVENUE_GATE - entry.mean.rr);
+  return ADAPTIVE_STEP_RISK_PENALTY + rrGap * 0.15;
+}
+
+function v21SelectionValue(entry) {
+  return entry.selectionScore - adaptiveStepPenalty(entry);
+}
+
+function compareV20TradeoffEvaluations(a, b) {
   const aPreferred = isFairnessPreferred(a.mean);
   const bPreferred = isFairnessPreferred(b.mean);
   if (aPreferred !== bPreferred) return aPreferred ? -1 : 1;
@@ -180,10 +219,37 @@ function compareEvaluations(a, b) {
   return b.score - a.score;
 }
 
+function compareV21Evaluations(a, b) {
+  const aFeasible = isRevenueFeasible(a.mean);
+  const bFeasible = isRevenueFeasible(b.mean);
+  if (aFeasible !== bFeasible) return aFeasible ? -1 : 1;
+
+  if (!aFeasible && !bFeasible && Math.abs(a.mean.rr - b.mean.rr) > 1e-9) {
+    return b.mean.rr - a.mean.rr;
+  }
+
+  const aPreferred = isFairnessPreferred(a.mean);
+  const bPreferred = isFairnessPreferred(b.mean);
+  if (aPreferred !== bPreferred) return aPreferred ? -1 : 1;
+  if (a.targetHits !== b.targetHits) return b.targetHits - a.targetHits;
+  const aSelection = v21SelectionValue(a);
+  const bSelection = v21SelectionValue(b);
+  if (Math.abs(aSelection - bSelection) > 1e-9) return bSelection - aSelection;
+  if (Math.abs(a.mean.fi - b.mean.fi) > 1e-9) return b.mean.fi - a.mean.fi;
+  if (Math.abs(a.mean.eg - b.mean.eg) > 1e-9) return a.mean.eg - b.mean.eg;
+  return b.score - a.score;
+}
+
+function compareEvaluations(a, b) {
+  return compareV21Evaluations(a, b);
+}
+
 function candidateObjective(entry) {
-  const rrPenalty = Math.max(0, 0.9 - entry.mean.rr) * 0.75;
+  const rrGap = Math.max(0, REVENUE_GATE - entry.mean.rr);
+  const rrPenalty = rrGap * 3.0;
+  const feasibleBonus = isRevenueFeasible(entry.mean) ? 0.2 : 0;
   const noisePenalty = ((entry.sd?.rr || 0) + (entry.sd?.eg || 0) + (entry.sd?.fi || 0)) * 0.05;
-  return entry.selectionScore - rrPenalty - noisePenalty;
+  return entry.selectionScore + feasibleBonus - rrPenalty - noisePenalty - adaptiveStepPenalty(entry);
 }
 
 function candidateSignature(cfg) {
@@ -781,12 +847,23 @@ async function searchRedesign(params, onProgress) {
     await sleep(0);
   }
 
-  const ordered = [...all].sort(compareEvaluations);
-  const pareto = computeParetoFront(all).sort(compareEvaluations);
+  const ordered = [...all].sort(compareV21Evaluations);
+  const tradeoffOrdered = [...all].sort(compareV20TradeoffEvaluations);
+  const feasible = all.filter(entry => isRevenueFeasible(entry.mean)).sort(compareV21Evaluations);
+  const pareto = computeParetoFront(all).sort(compareV21Evaluations);
+  const bestFeasible = feasible[0] || null;
+  const best = bestFeasible || ordered[0];
   return {
     all: ordered,
     pareto,
-    best: ordered[0],
+    best,
+    bestFeasible,
+    bestTradeoff: tradeoffOrdered[0],
+    revenueGate: REVENUE_GATE,
+    revenueFeasibleCount: feasible.length,
+    adaptivePenalty: ADAPTIVE_STEP_RISK_PENALTY,
+    revenueGateFallback: feasible.length === 0,
+    activeVersion: feasible.length ? "RTZ v2.1 revenue-gated" : "RTZ v2.1 fallback",
     searchSummary: {
       method: "random + elite mutation + Bayesian-lite/TPE surrogate",
       random: all.filter(entry => entry.searchStage === "random").length,
@@ -974,7 +1051,7 @@ async function runFullExperiment(input, onProgress) {
   await sleep(0);
 
   const redesign = await searchRedesign(input, msg => onProgress(`Optymalizacja: ${msg}`));
-  onProgress("RTZ v2.0 redesign gotowe.");
+  onProgress("RTZ v2.1 revenue-gated redesign gotowe.");
   await sleep(0);
 
   const ablation = await runAblation({ ...input, seedBase: input.seedBase + 400 }, msg => onProgress(msg));
@@ -1005,16 +1082,28 @@ async function runFullExperiment(input, onProgress) {
 // Exports
 // -------------------------
 
-function buildCSV(data) {
+function csvCell(value) {
+  if (value === null || value === undefined) return "";
+  const text = typeof value === "string" ? value : JSON.stringify(value);
+  return /[",\n]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text;
+}
+
+function csvRow(values) {
+  return `${values.map(csvCell).join(",")}\n`;
+}
+
+function buildCSV(data, archive = []) {
   const { legacy, validated, redesign } = data;
   const best = redesign.best;
   let csv = "comparison,metric,mean,sd,rawScore,selectionScore,targetHits\n";
 
-  [["legacy", legacy], ["validated", validated], ["v2_best", best]].forEach(([name, entry]) => {
+  [["legacy", legacy], ["validated", validated], ["v2_1_best", best], ["v2_0_tradeoff", redesign.bestTradeoff]].filter(([, entry]) => entry).forEach(([name, entry]) => {
     ["rr", "ae", "eg", "cr", "fi"].forEach(metric => {
       csv += `${name},${metric},${entry.mean[metric]},${entry.sd[metric]},${entry.score},${entry.selectionScore},${entry.targetHits}\n`;
     });
   });
+
+  csv += `\nREDESIGN,revenueGate,feasibleCount,fallback,activeVersion,adaptivePenalty\nredesign,${redesign.revenueGate ?? REVENUE_GATE},${redesign.revenueFeasibleCount ?? ""},${redesign.revenueGateFallback ?? ""},${redesign.activeVersion || "RTZ v2.1 revenue-gated"},${redesign.adaptivePenalty ?? ADAPTIVE_STEP_RISK_PENALTY}\n`;
 
   csv += "\npareto_rank,stage,acquisition,alpha,numFractions,allocationRule,stepType,maxConcentration,rr,ae,eg,cr,fi,rawScore,selectionScore,targetHits\n";
   data.redesign.pareto.forEach((entry, idx) => {
@@ -1040,7 +1129,84 @@ function buildCSV(data) {
     });
   }
 
+  const hypotheses = buildHypothesisAssessment(data, archive);
+  csv += "\nHYPOTHESES,hypothesis,status,statement,evidence\n";
+  Object.values(hypotheses).forEach(item => {
+    csv += csvRow([item.label, item.status, item.statement, item.evidence.join(" ")]);
+  });
+
+  if (archive.length) {
+    csv += "\nAUTOPILOT_RUNS,run,generatedAt,roundsLearn,roundsEval,reps,seedBase,seedSearch,searchExplore,searchExploit,searchBayes,rr,ae,eg,cr,fi,rawScore,selectionScore,targetHits,alpha,numFractions,allocationRule,stepType,maxConcentration,h1,h2\n";
+    archive.slice().reverse().forEach(entry => {
+      const row = entry.summary;
+      const assessment = entry.hypotheses || buildHypothesisAssessment(entry.result, archive);
+      csv += csvRow([
+        row.id,
+        row.generatedAt,
+        row.inputs.roundsLearn,
+        row.inputs.roundsEval,
+        row.inputs.reps,
+        row.inputs.seedBase,
+        row.inputs.seedSearch,
+        row.inputs.searchExplore,
+        row.inputs.searchExploit,
+        row.inputs.searchBayes,
+        row.rr,
+        row.ae,
+        row.eg,
+        row.cr,
+        row.fi,
+        row.score,
+        row.selectionScore,
+        row.targetHits,
+        row.cfg.alpha,
+        row.cfg.numFractions,
+        row.cfg.allocationRule,
+        row.cfg.stepType,
+        row.cfg.maxConcentration,
+        assessment.h1.status,
+        assessment.h2.status,
+      ]);
+    });
+
+    csv += "\nAUTOPILOT_CANDIDATES,run,rank,stage,acquisition,alpha,numFractions,allocationRule,stepType,maxConcentration,rr,ae,eg,cr,fi,rawScore,selectionScore,targetHits\n";
+    archive.slice().reverse().forEach(entry => {
+      entry.result.redesign.all.forEach((candidate, idx) => {
+        csv += csvRow([
+          entry.summary.id,
+          idx + 1,
+          candidate.searchStage || "",
+          candidate.acquisition ?? "",
+          candidate.cfg.alpha,
+          candidate.cfg.numFractions,
+          candidate.cfg.allocationRule,
+          candidate.cfg.stepType,
+          candidate.cfg.maxConcentration,
+          candidate.mean.rr,
+          candidate.mean.ae,
+          candidate.mean.eg,
+          candidate.mean.cr,
+          candidate.mean.fi,
+          candidate.score,
+          candidate.selectionScore,
+          candidate.targetHits,
+        ]);
+      });
+    });
+  }
+
   return csv;
+}
+
+function buildJSONExport(data, archive = []) {
+  return {
+    latest: data,
+    hypotheses: buildHypothesisAssessment(data, archive),
+    autopilot: {
+      runCount: archive.length,
+      runs: archive,
+    },
+  };
 }
 
 function buildLaTeX(data) {
@@ -1052,11 +1218,11 @@ function buildLaTeX(data) {
   const texLines = [
     String.raw`\begin{table}[h]`,
     String.raw`\centering`,
-    String.raw`\caption{From RTZ v1.0 legacy to RTZ v2.0 redesign}`,
+    String.raw`\caption{From RTZ v1.0 legacy to RTZ v2.1 revenue-gated redesign}`,
     String.raw`\label{tab:rtz-comparison}`,
     String.raw`\begin{tabular}{lccc}`,
     String.raw`\toprule`,
-    String.raw`Metric & v1.0 legacy & v1.1 validated & v2.0 redesign \\`,
+    String.raw`Metric & v1.0 legacy & v1.1 validated & v2.1 redesign \\`,
     String.raw`\midrule`,
   ];
 
@@ -1068,7 +1234,7 @@ function buildLaTeX(data) {
   texLines.push(String.raw`Fair-aware selection & ${legacy.selectionScore.toFixed(3)} & ${validated.selectionScore.toFixed(3)} & ${best.selectionScore.toFixed(3)} \\`);
   texLines.push(String.raw`\bottomrule`);
   texLines.push(String.raw`\end{tabular}`);
-  texLines.push(String.raw`\\[6pt]\small v2.0 configuration: $\alpha=${best.cfg.alpha}$, $S=${best.cfg.numFractions}$, allocation=$\text{${best.cfg.allocationRule}}$, step=$\text{${best.cfg.stepType}}$, $c_{max}=${best.cfg.maxConcentration}$. FI is computed on market types only (individual, institutional, speculator). Fairness-preferred selection requires RR $\geq 0.90$.`);
+  texLines.push(String.raw`\\[6pt]\small v2.1 configuration: $\alpha=${best.cfg.alpha}$, $S=${best.cfg.numFractions}$, allocation=$\text{${best.cfg.allocationRule}}$, step=$\text{${best.cfg.stepType}}$, $c_{max}=${best.cfg.maxConcentration}$. FI is computed on market types only (individual, institutional, speculator). v2.1 selects the best candidate subject to RR $\geq 0.90$ when such a candidate exists.`);
   texLines.push(String.raw`\end{table}`);
   texLines.push("");
   texLines.push("% Legacy to validated deltas");
@@ -1079,29 +1245,6 @@ function buildLaTeX(data) {
   return `${texLines.join("\n")}\n`;
 }
 
-function buildArticleNotes(data) {
-  const best = data.redesign.best;
-  const validationPass = `${data.validation.passed}/${data.validation.total}`;
-  const improvedOverValidated = ["rr", "ae", "cr", "fi"].filter(k => best.mean[k] > data.validated.mean[k]).length
-    + (best.mean.eg < data.validated.mean.eg ? 1 : 0);
-  const learningBest = data.learningCurve?.bestBySelectionDelta;
-
-  return [
-    "ARTYKUŁ — AKTUALIZACJA STRUKTURY",
-    "1. Wprowadzić trzy poziomy wersjonowania: RTZ v1.0 legacy, RTZ v1.1 validated, RTZ v2.0 redesign.",
-    `2. W sekcji metodologii dopisać walidację symulatora: ${validationPass} testów niezmienników przeszło.`,
-    "3. Uczciwie nazwać obecną populację agentów jako heterogenicznych agentów adaptacyjnych opartych o bandit learning; dopiero kolejny etap to pełny deep RL.",
-    "4. Wyniki główne raportować względem RTZ v1.1 validated, a RTZ v1.0 legacy zostawić jako baseline implementacyjny.",
-    "5. Fairness Index liczyć wyłącznie dla typów rynku: individual, institutional, speculator. Red Team pozostaje wyłącznie w EG / exploitability diagnostics.",
-    `6. Najlepsza konfiguracja v2.0: alpha=${best.cfg.alpha}, S=${best.cfg.numFractions}, R=${best.cfg.allocationRule}, step=${best.cfg.stepType}, c_max=${best.cfg.maxConcentration}.`,
-    `7. v2.0 poprawia wynik zagregowany względem v1.1 na ${improvedOverValidated}/5 metrykach wg obecnej symulacji, a wybór finalny jest fairness-aware z twardą barierą RR ≥ 0.90 (selection score ${best.selectionScore.toFixed(3)}).`,
-    "8. Interpretować spadek RR poniżej 0.90 jako konfigurację niedopuszczalną dla fairness-preferred selection, nawet jeśli FI/EG są dobre.",
-    learningBest ? `9. Krzywa uczenia: najwyższa delta selection względem validated wystąpiła przy T_learn=${learningBest.roundsLearn} (delta=${learningBest.selectionDelta.toFixed(3)}).` : "9. Krzywa uczenia nie została wygenerowana.",
-    "10. Dla validated i redesign utrzymać politykę minimalnej granularności S ≥ 1000.",
-    `11. Search v2.0 używa trybu ${data.redesign.searchSummary?.method || "heuristic mechanism search"}; etap Bayesian-lite jest surrogate-assisted/TPE-like, a nie pełnym BOHB.`,
-    "12. Dopisać ograniczenie: obecna wersja implementuje validated fairness-aware simulator i surrogate-assisted mechanism search, a nie jeszcze pełne BOHB+MARL."
-  ].join("\n");
-}
 function downloadText(text, filename) {
   const blob = new Blob([text], { type: "text/plain;charset=utf-8" });
   const url = URL.createObjectURL(blob);
@@ -1137,6 +1280,23 @@ function Label({ children }) {
     <div style={{ fontSize: 10, letterSpacing: "0.12em", textTransform: "uppercase", color: "#86868f", marginBottom: 8 }}>
       {children}
     </div>
+  );
+}
+
+function HelpLink({ href = "/help", children = "Pomoc" }) {
+  return (
+    <a
+      href={href}
+      style={{
+        color: "#bdb5ff",
+        fontSize: 11,
+        fontWeight: 800,
+        textDecoration: "none",
+        borderBottom: "1px solid rgba(189,181,255,0.45)",
+      }}
+    >
+      {children}
+    </a>
   );
 }
 
@@ -1273,7 +1433,10 @@ function MathHints() {
 
   return (
     <Box>
-      <Label>Matematyka metryk</Label>
+      <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "baseline" }}>
+        <Label>Matematyka metryk</Label>
+        <HelpLink href="/help#metrics">pełny opis</HelpLink>
+      </div>
       <div style={{ display: "grid", gap: 10 }}>
         {rows.map(([name, detail]) => (
           <div key={name} style={{ display: "grid", gap: 5 }}>
@@ -1305,14 +1468,17 @@ function ParameterHints() {
     ["T_eval", "liczba rund pomiaru po uczeniu", "metric = (1 ÷ Tₑᵥₐₗ) · ∑ₜ metricₜ", "Zwiększać przy wynikach blisko progów albo przy wysokim szumie, bo redukuje wariancję pomiaru po treningu."],
     ["reps", "liczba niezależnych seedów na konfigurację", "x̄ = (1 ÷ reps) · ∑ᵣ xᵣ,  sd = √(∑ᵣ(xᵣ − x̄)² ÷ (reps − 1))", "Zwiększać, gdy interesuje stabilność między populacjami i losowaniami."],
     ["seed window", "okno losowości dla populacji, uczenia i searchu", "seedBaseₖ₊₁ = seedBaseₖ + 1 000 003;  seedSearchₖ₊₁ = seedSearchₖ + 104 729", "Autopilot przesuwa seedy w każdej rekomendacji, żeby nie powtarzać identycznej trajektorii."],
-    ["explore/exploit", "budżet searchu mechanizmu", "Nᶜᵃⁿᵈ = searchExplore + searchExploit + searchBayes", "Zwiększać przy search-limited; to szuka lepszej konfiguracji mechanizmu, nie wydłuża treningu agentów."],
+    ["explore/exploit", "budżet searchu mechanizmu", "Nᶜᵃⁿᵈ = searchExplore + searchExploit + searchBayes", "Zwiększać przy search-limited; parametr rozszerza przeszukiwanie konfiguracji mechanizmu, nie wydłuża treningu agentów."],
     ["Bayesian-lite", "surrogate-assisted kandydaci", "x* = arg maxₓ [log ℓ(x) − log g(x) + novelty(x)]", "Po explore/exploit model TPE-like estymuje, gdzie dobre konfiguracje występują częściej, i wybiera kandydatów do pełnej ewaluacji symulatorem."],
     ["autopilot", "pętla badawcza", "runₖ → interpretacjaₖ → parametryₖ₊₁ → seedₖ₊₁ → runₖ₊₁", "Startuje od aktualnych suwaków, potem sam stosuje rekomendacje aż do limitu albo zatrzymania."],
   ];
 
   return (
     <Box>
-      <Label>Podpowiedzi parametrów</Label>
+      <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "baseline" }}>
+        <Label>Podpowiedzi parametrów</Label>
+        <HelpLink href="/help#parameters">więcej</HelpLink>
+      </div>
       <div style={{ display: "grid", gap: 10 }}>
         {rows.map(([name, shortText, formula, text]) => (
           <div key={name} style={{ display: "grid", gap: 5 }}>
@@ -1413,6 +1579,14 @@ function formatDeltaPct(v) {
   return `${sign}${(v * 100).toFixed(1)} pp`;
 }
 
+function formatPct(v) {
+  return `${(v * 100).toFixed(1)}%`;
+}
+
+function formatMeanSd(entry, key) {
+  return `${formatPct(entry.mean[key])} ± ${formatPct(entry.sd[key])}`;
+}
+
 function stepUp(value, step, max) {
   return Math.min(max, value + step);
 }
@@ -1446,7 +1620,7 @@ function buildNextExperimentPlan(data) {
     next.searchExploit = stepUp(next.searchExploit, 4, 24);
     next.searchBayes = stepUp(next.searchBayes ?? 0, 3, 18);
     next.roundsEval = stepUp(next.roundsEval, 20, 140);
-    reasons.push(`M1 RR v2.0=${(best.mean.rr * 100).toFixed(1)}% jest poniżej bariery 90%, więc kolejny run zwiększa search i T_eval.`);
+    reasons.push(`M1 RR v2.1=${(best.mean.rr * 100).toFixed(1)}% jest poniżej bariery 90%, więc kolejny run zwiększa search i T_eval.`);
   }
 
   if (best.selectionScore < validated.selectionScore || best.targetHits < validated.targetHits) {
@@ -1454,7 +1628,7 @@ function buildNextExperimentPlan(data) {
     next.searchExplore = stepUp(next.searchExplore, 2, 18);
     next.searchExploit = stepUp(next.searchExploit, 2, 24);
     next.searchBayes = stepUp(next.searchBayes ?? 0, 2, 18);
-    reasons.push(`v2.0 nie przebija validated wystarczająco stabilnie, więc kolejny run poszerza search i zwiększa liczbę kandydatów Bayesian-lite.`);
+    reasons.push(`v2.1 nie przebija validated wystarczająco stabilnie, więc kolejny run poszerza search i zwiększa liczbę kandydatów Bayesian-lite.`);
   }
 
   if (!METRIC_TARGETS.cr(best.mean.cr) || !METRIC_TARGETS.eg(best.mean.eg)) {
@@ -1501,6 +1675,109 @@ function buildNextExperimentPlan(data) {
   };
 }
 
+function hypothesisStatus(ok, partial) {
+  if (ok) return "wsparta";
+  if (partial) return "częściowo wsparta";
+  return "niewsparta";
+}
+
+function formatSignedNumber(v, digits = 3) {
+  const sign = v > 0 ? "+" : "";
+  return `${sign}${v.toFixed(digits)}`;
+}
+
+function buildHypothesisAssessment(data, archive = []) {
+  const archiveEntries = archive.filter(entry => entry.result && entry.summary);
+  const entries = archiveEntries.length
+    ? archiveEntries
+    : data
+      ? [{ result: data, summary: summarizeRun(data, 1) }]
+      : [];
+  const summaries = entries.map(entry => entry.summary);
+  const n = entries.length;
+
+  const fiDeltas = entries.map(entry => entry.result.redesign.best.mean.fi - entry.result.validated.mean.fi);
+  const egImprovements = entries.map(entry => entry.result.validated.mean.eg - entry.result.redesign.best.mean.eg);
+  const rrValues = entries.map(entry => entry.result.redesign.best.mean.rr);
+  const h1FullShare = entries.length
+    ? mean(entries.map(entry => {
+      const best = entry.result.redesign.best;
+      const validated = entry.result.validated;
+      return best.mean.rr >= 0.9 && best.mean.fi > validated.mean.fi && best.mean.eg < validated.mean.eg ? 1 : 0;
+    }))
+    : 0;
+  const rrMean = mean(rrValues);
+  const fiDeltaMean = mean(fiDeltas);
+  const egImprovementMean = mean(egImprovements);
+  const h1Full = n > 0 && rrMean >= 0.9 && fiDeltaMean > 0 && egImprovementMean > 0 && h1FullShare >= 0.6;
+  const h1Partial = n > 0 && rrMean >= 0.9 && (fiDeltaMean > 0 || egImprovementMean > 0 || h1FullShare >= 0.4);
+
+  const learningTrends = entries.map(entry => {
+    const learningRows = entry.result.learningCurve?.rows || [];
+    const firstLearning = learningRows[0];
+    const lastLearning = learningRows[learningRows.length - 1];
+    return firstLearning && lastLearning ? lastLearning.selectionDelta - firstLearning.selectionDelta : 0;
+  });
+  const learningBestAtHighEndShare = entries.length
+    ? mean(entries.map(entry => {
+      const learningRows = entry.result.learningCurve?.rows || [];
+      const learningBest = entry.result.learningCurve?.bestBySelectionDelta;
+      if (!learningRows.length || !learningBest) return 0;
+      return learningBest.roundsLearn === Math.max(...learningRows.map(row => row.roundsLearn)) ? 1 : 0;
+    }))
+    : 0;
+  const bayesianBestShare = entries.length
+    ? mean(entries.map(entry => entry.result.redesign.best.searchStage === "bayesian-lite" ? 1 : 0))
+    : 0;
+  const bayesianParetoShare = entries.length
+    ? mean(entries.map(entry => entry.result.redesign.pareto?.some(candidate => candidate.searchStage === "bayesian-lite") ? 1 : 0))
+    : 0;
+  const selectionSd = summaries.length > 1 ? sd(summaries.map(row => row.selectionScore)) : null;
+  const configShare = summaries.length
+    ? Math.max(...Object.values(summaries.reduce((acc, row) => {
+      const sig = candidateSignature(row.cfg);
+      acc[sig] = (acc[sig] || 0) + 1;
+      return acc;
+    }, {}))) / summaries.length
+    : null;
+  const stabilityObserved = summaries.length >= 3 && (selectionSd <= 0.03 || configShare >= 0.6);
+  const learningTrendMean = mean(learningTrends);
+  const h2Evidence = learningTrendMean > 0 || learningBestAtHighEndShare >= 0.5 || bayesianBestShare > 0 || bayesianParetoShare >= 0.5;
+  const h2Full = h2Evidence && stabilityObserved;
+  const h2Partial = h2Evidence || stabilityObserved;
+
+  return {
+    h1: {
+      label: "H1",
+      status: hypothesisStatus(h1Full, h1Partial),
+      supported: h1Full,
+      partial: h1Partial && !h1Full,
+      statement: "RTZ v2.1 poprawia fairness i odporność względem RTZ v1.1 bez naruszenia bariery RR ≥ 0.90.",
+      evidence: [
+        `Agregacja autopilota: n=${n}, średni RR v2.1=${formatPct(rrMean)} ${rrMean >= 0.9 ? "spełnia" : "nie spełnia"} barierę 90%.`,
+        `Średnie ΔFI względem v1.1=${formatSignedNumber(fiDeltaMean)}.`,
+        `Średnia poprawa EG względem v1.1=${formatSignedNumber(egImprovementMean)}; wartość dodatnia oznacza spadek exploitation gap.`,
+        `Pełne spełnienie H1 wystąpiło w ${(h1FullShare * 100).toFixed(0)}% przebiegów.`,
+      ],
+    },
+    h2: {
+      label: "H2",
+      status: hypothesisStatus(h2Full, h2Partial),
+      supported: h2Full,
+      partial: h2Partial && !h2Full,
+      statement: "Dłuższe uczenie oraz Bayesian-lite stabilizują wybór konfiguracji.",
+      evidence: [
+        `Agregacja autopilota: n=${n}, średni trend Δselection między skrajnymi T_learn=${formatSignedNumber(learningTrendMean)}.`,
+        `Najlepszy kandydat pochodził z Bayesian-lite w ${(bayesianBestShare * 100).toFixed(0)}% przebiegów; Bayesian-lite wystąpił na froncie Pareto w ${(bayesianParetoShare * 100).toFixed(0)}% przebiegów.`,
+        `Najlepszy punkt krzywej uczenia był na górnej granicy siatki w ${(learningBestAtHighEndShare * 100).toFixed(0)}% przebiegów.`,
+        selectionSd === null
+          ? "Stabilność między przebiegami wymaga co najmniej dwóch uruchomień; dla stabilności konfiguracji zalecane są co najmniej trzy."
+          : `Historia autopilota: sd(selection)=${selectionSd.toFixed(3)}, dominująca konfiguracja=${((configShare ?? 0) * 100).toFixed(0)}%.`,
+      ],
+    },
+  };
+}
+
 function summarizeRun(result, index) {
   const best = result.redesign.best;
   return {
@@ -1525,7 +1802,10 @@ function LearningCurveTable({ data }) {
 
   return (
     <Box>
-      <Label>Rundy uczenia vs poprawa metryk</Label>
+      <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "baseline" }}>
+        <Label>Rundy uczenia vs poprawa metryk</Label>
+        <HelpLink href="/help#learning">interpretacja</HelpLink>
+      </div>
       <div style={{ fontSize: 12, color: "#9696a0", lineHeight: 1.6, marginBottom: 10 }}>
         Delta jest liczona względem v1.1 validated. Dla EG dodatnia wartość oznacza spadek exploitation gap.
       </div>
@@ -1566,46 +1846,158 @@ function LearningCurveTable({ data }) {
   );
 }
 
-function ExperimentHistory({ rows }) {
-  if (!rows.length) return null;
+function RunDetail({ entry }) {
+  if (!entry) return null;
+  const { result, hypotheses } = entry;
+  const best = result.redesign.best;
+  const tradeoff = result.redesign.bestTradeoff;
+  const rows = ["rr", "ae", "eg", "cr", "fi"];
+  const learningBest = result.learningCurve?.bestBySelectionDelta;
+  const searchSummary = result.redesign.searchSummary || {};
+
+  return (
+    <div style={{ marginTop: 12, background: "#111115", border: "1px solid #292932", borderRadius: 8, padding: 12 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", gap: 12, flexWrap: "wrap", marginBottom: 10 }}>
+        <div>
+          <div style={{ color: "#fff", fontWeight: 800 }}>Szczegóły run #{entry.summary.id}</div>
+          <div style={{ color: "#8f8f98", fontSize: 11, lineHeight: 1.5 }}>
+            {entry.generatedAt} · T_learn={result.inputs.roundsLearn}, T_eval={result.inputs.roundsEval}, reps={result.inputs.reps}, seedBase={result.inputs.seedBase}, seedSearch={result.inputs.seedSearch}
+          </div>
+        </div>
+        <div style={{ color: "#d7d7dd", fontSize: 12 }}>
+          selection <strong style={{ color: "#fff" }}>{best.selectionScore.toFixed(3)}</strong> · raw <strong style={{ color: "#fff" }}>{best.score.toFixed(3)}</strong>
+        </div>
+      </div>
+
+      <div style={{ overflowX: "auto", marginBottom: 10 }}>
+        <table style={{ width: "100%", borderCollapse: "collapse", minWidth: 760 }}>
+          <thead>
+            <tr style={{ borderBottom: "1px solid #35353b" }}>
+              <th style={thStyle}>Metryka</th>
+              <th style={thStyle}>v1.0 legacy</th>
+              <th style={thStyle}>v1.1 validated</th>
+              <th style={thStyle}>v2.1 best</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map(key => (
+              <tr key={key} style={{ borderBottom: "1px solid #25252b" }}>
+                <td style={tdStyle}>{METRIC_LABELS[key]}</td>
+                <td style={tdStyle}>{formatMeanSd(result.legacy, key)}</td>
+                <td style={tdStyle}>{formatMeanSd(result.validated, key)}</td>
+                <td style={tdStyle}>{formatMeanSd(best, key)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(210px, 1fr))", gap: 8 }}>
+        <div style={{ color: "#d7d7dd", fontSize: 12, lineHeight: 1.55 }}>
+          <strong style={{ color: "#fff" }}>Konfiguracja v2.1:</strong><br />
+          α={best.cfg.alpha}, S={best.cfg.numFractions}, allocation={best.cfg.allocationRule}, step={best.cfg.stepType}, c_max={best.cfg.maxConcentration}
+          {tradeoff && tradeoff !== best ? (
+            <><br /><span style={{ color: "#a8a8b0" }}>v2.0 trade-off: RR={formatPct(tradeoff.mean.rr)}, FI={formatPct(tradeoff.mean.fi)}, EG={formatPct(tradeoff.mean.eg)}</span></>
+          ) : null}
+        </div>
+        <div style={{ color: "#d7d7dd", fontSize: 12, lineHeight: 1.55 }}>
+          <strong style={{ color: "#fff" }}>Search:</strong><br />
+          random={searchSummary.random ?? 0}, elite={searchSummary.eliteMutation ?? 0}, bayesian={searchSummary.bayesianLite ?? 0}, pareto={result.redesign.pareto.length}
+        </div>
+        <div style={{ color: "#d7d7dd", fontSize: 12, lineHeight: 1.55 }}>
+          <strong style={{ color: "#fff" }}>Hipotezy:</strong><br />
+          H1: {hypotheses?.h1?.status || "n/a"}; H2: {hypotheses?.h2?.status || "n/a"}
+        </div>
+        <div style={{ color: "#d7d7dd", fontSize: 12, lineHeight: 1.55 }}>
+          <strong style={{ color: "#fff" }}>Krzywa uczenia:</strong><br />
+          {learningBest ? `najlepsze T_learn=${learningBest.roundsLearn}, Δselection=${formatSignedNumber(learningBest.selectionDelta)}` : "brak danych"}
+        </div>
+        <div style={{ color: "#d7d7dd", fontSize: 12, lineHeight: 1.55 }}>
+          <strong style={{ color: "#fff" }}>Walidacja:</strong><br />
+          testy {result.validation.passed}/{result.validation.total}; targetHits={best.targetHits}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ExperimentHistory({ entries }) {
+  const [activeId, setActiveId] = useState(entries[0]?.id || null);
+  useEffect(() => {
+    setActiveId(entries[0]?.id || null);
+  }, [entries[0]?.id]);
+
+  if (!entries.length) return null;
+  const activeEntry = entries.find(entry => entry.id === activeId) || entries[0];
 
   return (
     <Box>
-      <Label>Historia iteracji</Label>
+      <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "baseline" }}>
+        <Label>Historia iteracji ({entries.length})</Label>
+        <HelpLink href="/help#autopilot">jak czytać?</HelpLink>
+      </div>
+      <div style={{ fontSize: 12, color: "#9696a0", lineHeight: 1.6, marginBottom: 10 }}>
+        Tabela zawiera wszystkie przebiegi zebrane w bieżącej sesji. Kliknij wiersz, aby pokazać pełny zestaw wyników dla danego runu poniżej tabeli.
+        Pełne obiekty wynikowe każdego przebiegu są dostępne w eksporcie JSON.
+      </div>
       <div style={{ overflowX: "auto" }}>
-        <table style={{ width: "100%", borderCollapse: "collapse", minWidth: 980 }}>
+        <table style={{ width: "100%", borderCollapse: "collapse", minWidth: 1180 }}>
           <thead>
             <tr style={{ borderBottom: "1px solid #35353b", color: "#9f9fa8", fontSize: 12 }}>
               <th style={thStyle}>Run</th>
               <th style={thStyle}>T_learn</th>
               <th style={thStyle}>T_eval</th>
               <th style={thStyle}>reps</th>
-              <th style={thStyle}>seed</th>
+              <th style={thStyle}>seedBase</th>
+              <th style={thStyle}>seedSearch</th>
               <th style={thStyle}>RR</th>
+              <th style={thStyle}>EG</th>
               <th style={thStyle}>CR</th>
               <th style={thStyle}>FI</th>
               <th style={thStyle}>selection</th>
-              <th style={thStyle}>v2.0 config</th>
+              <th style={thStyle}>H1</th>
+              <th style={thStyle}>H2</th>
+              <th style={thStyle}>v2.1 config</th>
             </tr>
           </thead>
           <tbody>
-            {rows.map(row => (
-              <tr key={row.id} style={{ borderBottom: "1px solid #25252b" }}>
-                <td style={tdStyle}>#{row.id}</td>
-                <td style={tdStyle}>{row.inputs.roundsLearn}</td>
-                <td style={tdStyle}>{row.inputs.roundsEval}</td>
-                <td style={tdStyle}>{row.inputs.reps}</td>
-                <td style={tdStyle}>{row.inputs.seedBase}</td>
-                <td style={tdStyle}>{(row.rr * 100).toFixed(1)}%</td>
-                <td style={tdStyle}>{(row.cr * 100).toFixed(1)}%</td>
-                <td style={tdStyle}>{(row.fi * 100).toFixed(1)}%</td>
-                <td style={tdStyle}>{row.selectionScore.toFixed(3)}</td>
-                <td style={tdStyle}>α={row.cfg.alpha}, S={row.cfg.numFractions}, {row.cfg.allocationRule}, {row.cfg.stepType}, c={row.cfg.maxConcentration}</td>
-              </tr>
-            ))}
+            {entries.map(entry => {
+              const row = entry.summary;
+              const active = entry.id === activeEntry?.id;
+              return (
+                <tr
+                  key={entry.id}
+                  tabIndex={0}
+                  title="Kliknij, aby pokazać szczegóły tego runu"
+                  onClick={() => setActiveId(entry.id)}
+                  onFocus={() => setActiveId(entry.id)}
+                  style={{
+                    borderBottom: "1px solid #25252b",
+                    background: active ? "rgba(139,124,246,0.12)" : "transparent",
+                    cursor: "pointer",
+                  }}
+                >
+                  <td style={tdStyle}>#{row.id}</td>
+                  <td style={tdStyle}>{row.inputs.roundsLearn}</td>
+                  <td style={tdStyle}>{row.inputs.roundsEval}</td>
+                  <td style={tdStyle}>{row.inputs.reps}</td>
+                  <td style={tdStyle}>{row.inputs.seedBase}</td>
+                  <td style={tdStyle}>{row.inputs.seedSearch}</td>
+                  <td style={tdStyle}>{(row.rr * 100).toFixed(1)}%</td>
+                  <td style={tdStyle}>{(row.eg * 100).toFixed(1)}%</td>
+                  <td style={tdStyle}>{(row.cr * 100).toFixed(1)}%</td>
+                  <td style={tdStyle}>{(row.fi * 100).toFixed(1)}%</td>
+                  <td style={tdStyle}>{row.selectionScore.toFixed(3)}</td>
+                  <td style={tdStyle}>{entry.hypotheses?.h1?.status || ""}</td>
+                  <td style={tdStyle}>{entry.hypotheses?.h2?.status || ""}</td>
+                  <td style={tdStyle}>α={row.cfg.alpha}, S={row.cfg.numFractions}, {row.cfg.allocationRule}, {row.cfg.stepType}, c={row.cfg.maxConcentration}</td>
+                </tr>
+              );
+            })}
           </tbody>
         </table>
       </div>
+      <RunDetail entry={activeEntry} />
     </Box>
   );
 }
@@ -1621,9 +2013,14 @@ function SearchDiagnostics({ redesign }) {
 
   return (
     <Box>
-      <Label>Diagnostyka searchu</Label>
+      <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "baseline" }}>
+        <Label>Diagnostyka searchu</Label>
+        <HelpLink href="/help#search">matematyka searchu</HelpLink>
+      </div>
       <div style={{ fontSize: 12, color: "#a8a8b0", lineHeight: 1.6, marginBottom: 10 }}>
         Bayesian-lite nie zastępuje walidacji konfiguracji. Model zastępczy generuje kandydatów, a każdy z nich jest następnie mierzony tym samym symulatorem co explore/exploit.
+        v2.1 wybiera najlepszy wariant z bramką RR ≥ {formatPct(redesign.revenueGate ?? REVENUE_GATE)}; jeżeli search nie znajdzie wariantu spełniającego bramkę, raportuje fallback.
+        Reguła kroku adaptive ma karę ryzyka {((redesign.adaptivePenalty ?? ADAPTIVE_STEP_RISK_PENALTY) * 100).toFixed(1)} pp w rankingu v2.1, ale pozostaje widoczna w rankingu trade-off.
       </div>
       <div style={{ display: "grid", gridTemplateColumns: "repeat(3, minmax(0,1fr))", gap: 8, marginBottom: 10 }}>
         {stageRows.map(([stage, label, count]) => (
@@ -1641,6 +2038,8 @@ function SearchDiagnostics({ redesign }) {
           Najlepszy kandydat z Bayesian-lite: selection <strong style={{ color: "#fff" }}>{bayesianBest.selectionScore.toFixed(3)}</strong>,
           acquisition <strong style={{ color: "#fff" }}>{(bayesianBest.acquisition ?? 0).toFixed(3)}</strong>,
           config α={bayesianBest.cfg.alpha}, S={bayesianBest.cfg.numFractions}, {bayesianBest.cfg.allocationRule}, {bayesianBest.cfg.stepType}, c={bayesianBest.cfg.maxConcentration}.
+          <br />
+          Kandydaci spełniający bramkę przychodową: <strong style={{ color: "#fff" }}>{redesign.revenueFeasibleCount ?? 0}</strong>; aktywny wariant: <strong style={{ color: "#fff" }}>{redesign.activeVersion || "RTZ v2.1 revenue-gated"}</strong>.
         </div>
       ) : (
         <div style={{ marginTop: 10, fontSize: 12, color: "#d7d7dd", lineHeight: 1.6 }}>
@@ -1651,96 +2050,141 @@ function SearchDiagnostics({ redesign }) {
   );
 }
 
-function Results({ data, onApplyParams, onApplyAndRun, onAutoRun, autoRunLimit }) {
-  const best = data.redesign.best;
-  const pareto = data.redesign.pareto;
-  const noteText = buildArticleNotes(data);
+function HypothesisPanel({ data, archive }) {
+  const assessment = buildHypothesisAssessment(data, archive);
+  const rows = Object.values(assessment);
+  const colorFor = item => item.supported ? "#2ecc71" : item.partial ? "#f0a030" : "#ff6b6b";
+  const runCount = archive.length || 1;
+
+  return (
+    <Box accent="#4aa7ff40">
+      <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "baseline" }}>
+        <Label>Ocena hipotez z autopilota</Label>
+        <HelpLink href="/help#hypotheses">opis hipotez</HelpLink>
+      </div>
+      <div style={{ color: "#a8a8b0", fontSize: 12, lineHeight: 1.6, marginBottom: 10 }}>
+        Werdykt jest liczony na podstawie {runCount} {runCount === 1 ? "przebiegu" : "przebiegów"} zapisanych w historii sesji, a nie tylko ostatniego wyniku.
+      </div>
+      <div style={{ display: "grid", gap: 10 }}>
+        {rows.map(item => (
+          <div key={item.label} style={{ background: "#111115", border: "1px solid #292932", borderRadius: 8, padding: 12 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "center", marginBottom: 6 }}>
+              <div style={{ color: "#fff", fontWeight: 800 }}>{item.label}</div>
+              <span style={{ color: colorFor(item), fontSize: 12, fontWeight: 800 }}>{item.status}</span>
+            </div>
+            <div style={{ color: "#d7d7dd", fontSize: 12, lineHeight: 1.55, marginBottom: 8 }}>{item.statement}</div>
+            <div style={{ display: "grid", gap: 4 }}>
+              {item.evidence.map(line => (
+                <div key={line} style={{ color: "#a8a8b0", fontSize: 11, lineHeight: 1.45 }}>{line}</div>
+              ))}
+            </div>
+          </div>
+        ))}
+      </div>
+    </Box>
+  );
+}
+
+function AutopilotSummary({ archive }) {
+  if (!archive.length) return null;
+  const validArchive = archive.filter(entry => entry.summary && entry.result);
+  if (!validArchive.length) return null;
+  const rows = validArchive.map(entry => entry.summary);
+  const best = [...validArchive].sort((a, b) => b.summary.selectionScore - a.summary.selectionScore)[0];
+  const feasibleRuns = rows.filter(row => row.rr >= REVENUE_GATE);
+  const adaptiveRuns = rows.filter(row => row.cfg?.stepType === "adaptive").length;
+  const metrics = [
+    ["rr", "M1 Revenue Ratio", "max"],
+    ["ae", "M2 Allocative Efficiency", "max"],
+    ["eg", "M3 Exploitation Gap", "min"],
+    ["cr", "M4 Completion Rate", "max"],
+    ["fi", "M5 Fairness Index", "max"],
+    ["selectionScore", "Fair-aware selection", "max"],
+  ];
+  const statusCount = key => validArchive.reduce((acc, entry) => {
+    const status = entry.hypotheses?.[key]?.status || "brak";
+    acc[status] = (acc[status] || 0) + 1;
+    return acc;
+  }, {});
+  const h1 = statusCount("h1");
+  const h2 = statusCount("h2");
+
+  return (
+    <Box accent="#f0a03040">
+      <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "baseline", flexWrap: "wrap" }}>
+        <Label>Podsumowanie autopilota</Label>
+        <div style={{ color: "#9b9ba6", fontSize: 12 }}>n={validArchive.length} przebiegów z bieżącej sesji</div>
+      </div>
+      <div style={{ color: "#c8c8cf", fontSize: 12, lineHeight: 1.6, marginBottom: 10 }}>
+        To jest agregacja po wszystkich zebranych wywołaniach autopilota. Szczegóły pojedynczego przebiegu są dostępne po kliknięciu wiersza w Historii iteracji.
+      </div>
+      <div style={{ background: "#111115", border: "1px solid #292932", borderRadius: 8, padding: 10, color: "#d7d7dd", fontSize: 12, lineHeight: 1.6, marginBottom: 10 }}>
+        <strong style={{ color: "#fff" }}>Co uzyskaliśmy:</strong> RTZ v2.1 rozdziela ranking mechanizmu na best feasible i best trade-off.
+        Rekomendacja mechanizmu korzysta z best feasible, czyli najlepszego kandydata z RR ≥ {formatPct(REVENUE_GATE)}.
+        Best trade-off pozostaje diagnostyką pokazującą, ile fairness/EG można uzyskać, jeśli dopuścić utratę przychodu.
+        W tej historii {feasibleRuns.length}/{rows.length} runów spełnia bramkę RR, a adaptive wystąpił w {adaptiveRuns}/{rows.length} rekomendowanych konfiguracji.
+      </div>
+      <div style={{ overflowX: "auto" }}>
+        <table style={{ width: "100%", borderCollapse: "collapse", minWidth: 760 }}>
+          <thead>
+            <tr style={{ borderBottom: "1px solid #35353b" }}>
+              <th style={thStyle}>Metryka</th>
+              <th style={thStyle}>średnia ± sd</th>
+              <th style={thStyle}>zakres</th>
+              <th style={thStyle}>najlepszy run</th>
+            </tr>
+          </thead>
+          <tbody>
+            {metrics.map(([key, label, direction]) => {
+              const values = rows.map(row => row[key]);
+              const bestRow = [...rows].sort((a, b) => direction === "min" ? a[key] - b[key] : b[key] - a[key])[0];
+              const pct = key !== "selectionScore";
+              const fmt = value => pct ? formatPct(value) : value.toFixed(3);
+              return (
+                <tr key={key} style={{ borderBottom: "1px solid #25252b" }}>
+                  <td style={tdStyle}>{label}</td>
+                  <td style={tdStyle}>{fmt(mean(values))} ± {pct ? formatPct(sd(values)) : sd(values).toFixed(3)}</td>
+                  <td style={tdStyle}>{fmt(Math.min(...values))} - {fmt(Math.max(...values))}</td>
+                  <td style={tdStyle}>#{bestRow.id} ({fmt(bestRow[key])})</td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))", gap: 8, marginTop: 10 }}>
+        <div style={{ background: "#111115", border: "1px solid #292932", borderRadius: 8, padding: 10, color: "#d7d7dd", fontSize: 12, lineHeight: 1.55 }}>
+          <strong style={{ color: "#fff" }}>Najlepszy run wg selection:</strong><br />
+          #{best.summary.id}, selection={best.summary.selectionScore.toFixed(3)}, RR={formatPct(best.summary.rr)}, FI={formatPct(best.summary.fi)}, EG={formatPct(best.summary.eg)}
+        </div>
+        <div style={{ background: "#111115", border: "1px solid #292932", borderRadius: 8, padding: 10, color: "#d7d7dd", fontSize: 12, lineHeight: 1.55 }}>
+          <strong style={{ color: "#fff" }}>Konfiguracja v2.1 najlepszego runu:</strong><br />
+          α={best.summary.cfg.alpha}, S={best.summary.cfg.numFractions}, {best.summary.cfg.allocationRule}, {best.summary.cfg.stepType}, c={best.summary.cfg.maxConcentration}
+        </div>
+        <div style={{ background: "#111115", border: "1px solid #292932", borderRadius: 8, padding: 10, color: "#d7d7dd", fontSize: 12, lineHeight: 1.55 }}>
+          <strong style={{ color: "#fff" }}>Hipotezy w historii:</strong><br />
+          H1: wsparta {h1.wsparta || 0}, częściowo {h1["częściowo wsparta"] || 0}, niewsparta {h1.niewsparta || 0}<br />
+          H2: wsparta {h2.wsparta || 0}, częściowo {h2["częściowo wsparta"] || 0}, niewsparta {h2.niewsparta || 0}
+        </div>
+      </div>
+    </Box>
+  );
+}
+
+function Results({ data, archive, onApplyParams, onApplyAndRun, onAutoRun, autoRunLimit }) {
   const nextPlan = buildNextExperimentPlan(data);
 
   return (
     <div style={{ display: "grid", gap: 14 }}>
-      <Box accent="#2ecc7140">
-        <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "baseline", flexWrap: "wrap" }}>
-          <div>
-            <Label>Najważniejszy wynik</Label>
-            <div style={{ fontSize: 22, color: "#fff", fontWeight: 700 }}>RTZ v1.0 → v1.1 → v2.0</div>
-            <div style={{ fontSize: 12, color: "#90909a", marginTop: 4 }}>
-              historyczny baseline, poprawny symulator i zoptymalizowany redesign mechanizmu
-            </div>
-          </div>
-          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-            <StatusPill ok text={`Testy: ${data.validation.passed}/${data.validation.total}`} />
-            <StatusPill ok={best.score >= data.validated.score} text={`raw ${best.score.toFixed(3)}`} />
-            <StatusPill ok={best.selectionScore >= data.validated.selectionScore} text={`selection ${best.selectionScore.toFixed(3)}`} />
-          </div>
-        </div>
+      <AutopilotSummary archive={archive} />
 
-        <div style={{ marginTop: 14, overflowX: "auto" }}>
-          <table style={{ width: "100%", borderCollapse: "collapse", minWidth: 720 }}>
-            <thead>
-              <tr style={{ borderBottom: "1px solid #35353b", color: "#9f9fa8", fontSize: 12 }}>
-                <th style={thStyle}>Metryka</th>
-                <th style={thStyle}>v1.0 legacy</th>
-                <th style={thStyle}>v1.1 validated</th>
-                <th style={thStyle}>v2.0 redesign</th>
-              </tr>
-            </thead>
-            <tbody>
-              {["rr", "ae", "eg", "cr", "fi"].map(key => (
-                <SummaryRow
-                  key={key}
-                  label={METRIC_LABELS[key]}
-                  formula={METRIC_DETAILS[key].formula}
-                  help={`${METRIC_DETAILS[key].target}. ${METRIC_DETAILS[key].help}`}
-                  a={`${(data.legacy.mean[key] * 100).toFixed(1)}% ± ${(data.legacy.sd[key] * 100).toFixed(1)}`}
-                  b={`${(data.validated.mean[key] * 100).toFixed(1)}% ± ${(data.validated.sd[key] * 100).toFixed(1)}`}
-                  c={`${(best.mean[key] * 100).toFixed(1)}% ± ${(best.sd[key] * 100).toFixed(1)}`}
-                />
-              ))}
-              <SummaryRow
-                label="Weighted score"
-                formula={SELECTION_DETAILS.formula}
-                help={SELECTION_DETAILS.help}
-                a={data.legacy.score.toFixed(3)}
-                b={data.validated.score.toFixed(3)}
-                c={best.score.toFixed(3)}
-              />
-              <SummaryRow
-                label="Fair-aware selection"
-                formula={SELECTION_DETAILS.selectionFormula}
-                help={SELECTION_DETAILS.help}
-                a={data.legacy.selectionScore.toFixed(3)}
-                b={data.validated.selectionScore.toFixed(3)}
-                c={best.selectionScore.toFixed(3)}
-              />
-            </tbody>
-          </table>
-        </div>
-
-        <div style={{ marginTop: 12, fontSize: 12, color: "#c8c8cf", lineHeight: 1.7 }}>
-          <div><strong style={{ color: "#fff" }}>v2.0 config:</strong> α={best.cfg.alpha}, S={best.cfg.numFractions}, R={best.cfg.allocationRule}, step={best.cfg.stepType}, c_max={best.cfg.maxConcentration}</div>
-          <div><strong style={{ color: "#fff" }}>Selection:</strong> fairness-aware ranking, RR ≥ 90%, FI bez Red Teamu</div>
-          <div><strong style={{ color: "#fff" }}>Search:</strong> {data.redesign.searchSummary?.method || "heuristic search"}</div>
-          <div><strong style={{ color: "#fff" }}>Pareto front:</strong> {pareto.length} niezdominowanych konfiguracji</div>
-        </div>
-      </Box>
-
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(5, minmax(0,1fr))", gap: 10 }}>
-        {["rr", "ae", "eg", "cr", "fi"].map(key => (
-          <MetricCard
-            key={key}
-            label={METRIC_LABELS[key]}
-            mean={best.mean[key]}
-            sd={best.sd[key]}
-            good={METRIC_TARGETS[key](best.mean[key])}
-            formula={METRIC_DETAILS[key].formula}
-            help={`${METRIC_DETAILS[key].target}. ${METRIC_DETAILS[key].help}`}
-          />
-        ))}
-      </div>
+      <HypothesisPanel data={data} archive={archive} />
 
       <Box>
-        <Label>Walidacja symulatora</Label>
+        <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "baseline" }}>
+          <Label>Walidacja symulatora</Label>
+          <HelpLink href="/help#validation">co oznacza PASS?</HelpLink>
+        </div>
         <div style={{ display: "grid", gap: 8 }}>
           {data.validation.cases.map(test => (
             <div key={test.name} style={{ display: "flex", justifyContent: "space-between", gap: 12, borderBottom: "1px solid #232329", paddingBottom: 8 }}>
@@ -1755,7 +2199,10 @@ function Results({ data, onApplyParams, onApplyAndRun, onAutoRun, autoRunLimit }
       </Box>
 
       <Box>
-        <Label>Ablacja względem v1.1 validated</Label>
+        <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "baseline" }}>
+          <Label>Ablacja względem v1.1 validated</Label>
+          <HelpLink href="/help#ablation">po co ablacja?</HelpLink>
+        </div>
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
           <SimpleLineChart rows={data.ablation.alpha} metricKey="rr" title="alpha → Revenue Ratio" />
           <SimpleLineChart rows={data.ablation.maxConcentration} metricKey="fi" title="c_max → Fairness" />
@@ -1769,7 +2216,10 @@ function Results({ data, onApplyParams, onApplyAndRun, onAutoRun, autoRunLimit }
       <SearchDiagnostics redesign={data.redesign} />
 
       <Box accent="#8b7cf640">
-        <Label>Następny eksperyment</Label>
+        <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "baseline" }}>
+          <Label>Następny eksperyment</Label>
+          <HelpLink href="/help#autopilot">logika rekomendacji</HelpLink>
+        </div>
         <div style={{ fontSize: 13, color: "#fff", fontWeight: 700, marginBottom: 8 }}>
           Rekomendowane parametry kolejnego przebiegu
         </div>
@@ -1844,39 +2294,30 @@ function Results({ data, onApplyParams, onApplyAndRun, onAutoRun, autoRunLimit }
       </Box>
 
       <Box>
-        <Label>Wnioski do artykułu</Label>
-        <pre
-          style={{
-            margin: 0,
-            whiteSpace: "pre-wrap",
-            fontSize: 12,
-            lineHeight: 1.7,
-            color: "#d7d7dd",
-            background: "#111115",
-            padding: 14,
-            borderRadius: 10,
-            border: "1px solid #25252b",
-          }}
-        >
-          {noteText}
-        </pre>
-      </Box>
-
-      <Box>
-        <Label>Eksport</Label>
+        <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "baseline" }}>
+          <Label>Eksport</Label>
+          <HelpLink href="/help#exports">formaty</HelpLink>
+        </div>
+        <div style={{ color: "#d7d7dd", fontSize: 12, lineHeight: 1.55, marginBottom: 10 }}>
+          Zebrano <strong style={{ color: "#fff" }}>{archive.length}</strong> przebiegów w bieżącej sesji. Eksport obejmuje wszystkie zapisane przebiegi autopilota.
+        </div>
         <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
-          <button style={btnSecondary} onClick={() => downloadText(buildCSV(data), "rtz_rebuild_results.csv")}>
-            Pobierz CSV
+          <button style={btnSecondary} onClick={() => downloadText(buildCSV(data, archive), "rtz_rebuild_results.csv")}>
+            Pobierz CSV z autopilotem
           </button>
           <button style={btnSecondary} onClick={() => downloadText(buildLaTeX(data), "rtz_rebuild_table.tex")}>
             Pobierz LaTeX
           </button>
-          <button style={btnSecondary} onClick={() => downloadText(JSON.stringify(data, null, 2), "rtz_rebuild_raw.json")}>
-            Pobierz JSON
+          <button style={btnSecondary} onClick={() => downloadText(JSON.stringify(buildJSONExport(data, archive), null, 2), "rtz_rebuild_full.json")}>
+            Pobierz pełny JSON
           </button>
-          <button style={btnSecondary} onClick={() => downloadText(noteText, "rtz_article_notes.txt")}>
-            Pobierz notatki do artykułu
+          <button style={btnSecondary} onClick={() => downloadText(JSON.stringify({ generatedAt: new Date().toISOString(), runCount: archive.length, runs: archive }, null, 2), "rtz_autopilot_archive.json")}>
+            Pobierz tylko autopilota
           </button>
+        </div>
+        <div style={{ color: "#9b9ba6", fontSize: 11, lineHeight: 1.5, marginTop: 8 }}>
+          JSON zawiera ostatni pełny wynik, ocenę hipotez oraz pełną historię przebiegów autopilota zapisaną w tej sesji.
+          CSV zawiera także tabelę `AUTOPILOT_RUNS` i kandydatów `AUTOPILOT_CANDIDATES`.
         </div>
       </Box>
     </div>
@@ -1933,11 +2374,11 @@ export default function App() {
   const [busy, setBusy] = useState(false);
   const [phase, setPhase] = useState("Gotowe.");
   const [data, setData] = useState(null);
-  const [history, setHistory] = useState([]);
+  const [runArchive, setRunArchive] = useState([]);
   const [autoMode, setAutoMode] = useState(false);
   const [autoRunLimit, setAutoRunLimit] = useState(DEFAULT_AUTOPILOT_RUN_LIMIT);
   const stopAutoRef = useRef(false);
-
+  const storageReadyRef = useRef(false);
   const estimatedEvaluations = useMemo(() => {
     return 2 + searchExplore + searchExploit + searchBayes + (7 + 4 + 4 + 3 + 6) + learningRoundGrid(roundsLearn).length * 2;
   }, [roundsLearn, searchExplore, searchExploit, searchBayes]);
@@ -1954,6 +2395,34 @@ export default function App() {
     if (typeof next.seedBase === "number") setSeedBase(next.seedBase);
     if (typeof next.seedSearch === "number") setSeedSearch(next.seedSearch);
   }, []);
+
+  useEffect(() => {
+    const stored = readStoredSession();
+    const restoredArchive = Array.isArray(stored?.runArchive)
+      ? stored.runArchive
+      : Array.isArray(stored?.autopilot?.runs)
+        ? stored.autopilot.runs
+        : [];
+    const restoredData = stored?.data || stored?.latest || restoredArchive[0]?.result || null;
+
+    if (restoredArchive.length) setRunArchive(restoredArchive);
+    if (restoredData) {
+      setData(restoredData);
+      if (restoredData.inputs) applyParamState(restoredData.inputs);
+      setPhase(`Przywrócono ${restoredArchive.length || 1} zapisanych przebiegów z bieżącej sesji.`);
+    }
+    storageReadyRef.current = true;
+  }, [applyParamState]);
+
+  useEffect(() => {
+    if (!storageReadyRef.current) return;
+    if (!data && !runArchive.length) return;
+    writeStoredSession({
+      savedAt: new Date().toISOString(),
+      data,
+      runArchive,
+    });
+  }, [data, runArchive]);
 
   const buildRunParams = useCallback((overrides = {}) => ({
     nAgents,
@@ -1980,7 +2449,14 @@ export default function App() {
     try {
       const result = await runFullExperiment(params, setPhase);
       setData(result);
-      setHistory(prev => [summarizeRun(result, (prev[0]?.id || 0) + 1), ...prev].slice(0, 8));
+      setRunArchive(prev => {
+        const id = (prev[0]?.summary?.id || 0) + 1;
+        const summary = summarizeRun(result, id);
+        const draft = [{ id, generatedAt: result.generatedAt, summary, result }, ...prev];
+        return draft.map((entry, idx) => idx === 0
+          ? { ...entry, hypotheses: buildHypothesisAssessment(result, draft) }
+          : entry);
+      });
 
       const nextPlan = buildNextExperimentPlan(result);
       if (autoRemaining > 0 && !stopAutoRef.current) {
@@ -2037,10 +2513,10 @@ export default function App() {
     >
       <div style={{ maxWidth: 1180, margin: "0 auto" }}>
         <div
+          className="rtz-hero-grid"
           style={{
             marginBottom: 16,
             display: "grid",
-            gridTemplateColumns: "minmax(0,1fr) minmax(280px,360px)",
             gap: 14,
             alignItems: "start",
           }}
@@ -2050,14 +2526,39 @@ export default function App() {
               RTZ Auction Lab
             </div>
             <h1 style={{ fontSize: 30, lineHeight: 1.15, margin: 0 }}>
-              Rebuild: legacy baseline, validated simulator, v2.0 redesign
+              Rebuild: legacy baseline, validated simulator, v2.1 redesign
             </h1>
             <div style={{ marginTop: 8, color: "#9b9ba6", maxWidth: 760, lineHeight: 1.65 }}>
-              Jedna aplikacja do trzech zadań: zrekonstruować punkt startowy v1.0, zbudować poprawny symulator v1.1 oraz
-              uruchomić redesign mechanizmu v2.0 na adaptacyjnych agentach z replikacjami, walidacją i eksportem wyników.
+              Celem aplikacji jest ocena, czy zmodyfikowana aukcja holenderska dla frakcjonalizowanych strumieni tantiem może utrzymać przychód sprzedającego,
+              poprawić strukturę alokacji między segmentami rynku oraz ograniczyć przewagę strategii exploitacyjnych.
+              {" "}
+              <HelpLink href="/help#start">interpretacja</HelpLink>
+              {" "}
+              <HelpLink href="/help#domain">kontekst rynku</HelpLink>
+            </div>
+            <div
+              className="rtz-hero-cards"
+              style={{
+                marginTop: 12,
+                display: "grid",
+                gap: 8,
+              }}
+            >
+              {[
+                ["Cel", "Porównać wariant historyczny, walidowany baseline i redesign mechanizmu."],
+                ["Realizacja", "Symulator wykonuje uczenie, ewaluację i przeszukiwanie parametrów mechanizmu."],
+                ["Hipoteza H1", "v2.1 może poprawić fairness i odporność bez zejścia poniżej RR ≥ 90%."],
+                ["Hipoteza H2", "Dłuższe uczenie i Bayesian-lite powinny stabilizować wybór konfiguracji."],
+              ].map(([label, text]) => (
+                <div key={label} style={{ background: "#15151b", border: "1px solid #2c2c35", borderRadius: 8, padding: 10 }}>
+                  <div style={{ color: "#8b7cf6", fontSize: 10, textTransform: "uppercase", fontWeight: 800 }}>{label}</div>
+                  <div style={{ color: "#d7d7dd", fontSize: 12, lineHeight: 1.45, marginTop: 4 }}>{text}</div>
+                </div>
+              ))}
             </div>
           </div>
           <div
+            className="rtz-quick-panel"
             style={{
               background: "#15151b",
               border: "1px solid #2c2c35",
@@ -2069,11 +2570,16 @@ export default function App() {
           >
             <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "center" }}>
               <div>
-                <div style={{ fontSize: 10, color: "#8b7cf6", letterSpacing: "0.08em", textTransform: "uppercase", fontWeight: 800 }}>
-                  Szybkie akcje
+                <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+                  <div style={{ fontSize: 10, color: "#8b7cf6", letterSpacing: "0.08em", textTransform: "uppercase", fontWeight: 800 }}>
+                    Szybkie akcje
+                  </div>
+                  <HelpLink href="/help">Pomoc</HelpLink>
                 </div>
                 <div style={{ fontSize: 11, color: "#9b9ba6", marginTop: 2 }}>
                   {estimatedEvaluations} ewaluacji, reps={reps}
+                  {" "}
+                  <HelpLink href="/help#quick-actions">opis akcji</HelpLink>
                 </div>
               </div>
               <StatusPill ok={!busy} text={busy ? "running" : "ready"} />
@@ -2097,6 +2603,8 @@ export default function App() {
             </div>
             <div style={{ fontSize: 11, color: "#bdbdc6", lineHeight: 1.45, minHeight: 30 }}>
               {phase}
+              {" "}
+              <HelpLink href="/help#workflow">etapy</HelpLink>
             </div>
           </div>
         </div>
@@ -2104,7 +2612,10 @@ export default function App() {
         <div style={{ display: "grid", gridTemplateColumns: "320px minmax(0,1fr)", gap: 16, alignItems: "start" }}>
           <div style={{ display: "grid", gap: 12 }}>
             <Box>
-              <Label>Parametry eksperymentu</Label>
+              <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "baseline" }}>
+                <Label>Parametry eksperymentu</Label>
+                <HelpLink href="/help#parameters">opis parametrów</HelpLink>
+              </div>
               <Slider label="Liczba agentów" hint="Populacja heterogenicznych agentów" tooltip="nAgents: liczba agentów w jednej populacji. Więcej agentów zwiększa różnorodność rynku i koszt symulacji." value={nAgents} min={10} max={60} step={5} onChange={setNAgents} display={String(nAgents)} />
               <Slider label="Wartość katalogu" hint="Wartość fundamentalna V w PLN" tooltip="V: wartość fundamentalna katalogu. M1 Revenue Ratio liczy RR = revenue / V." value={tv} min={10000} max={200000} step={10000} onChange={setTv} display={`${Math.round(tv / 1000)}k`} />
               <Slider label="T_learn" hint="Rundy uczenia w jednej repetycji" tooltip="T_learn: liczba rund aktualizacji Q. Qₐ ← Qₐ + (r − Qₐ) ÷ nₐ." value={roundsLearn} min={40} max={250} step={20} onChange={setRoundsLearn} display={String(roundsLearn)} />
@@ -2113,25 +2624,31 @@ export default function App() {
             </Box>
 
             <Box>
-              <Label>Redesign search</Label>
+              <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "baseline" }}>
+                <Label>Redesign search</Label>
+                <HelpLink href="/help#search">jak wybiera kandydatów?</HelpLink>
+              </div>
               <Slider label="Eksploracja" hint="Losowe kandydackie konfiguracje" tooltip="searchExplore: liczba losowych konfiguracji mechanizmu. Nᶜᵃⁿᵈ = searchExplore + searchExploit + searchBayes." value={searchExplore} min={6} max={18} step={1} onChange={setSearchExplore} display={String(searchExplore)} />
               <Slider label="Eksploatacja" hint="Mutacje najlepszych kandydatów" tooltip="searchExploit: liczba mutacji elitarnych konfiguracji. Zwiększa lokalne przeszukanie wokół najlepszych wyników." value={searchExploit} min={8} max={24} step={1} onChange={setSearchExploit} display={String(searchExploit)} />
               <Slider label="Bayesian-lite" hint="Kandydaci z modelu zastępczego TPE-like" tooltip="searchBayes: liczba kandydatów proponowanych po explore/exploit przez surrogate-assisted search. Kandydaci są nadal pełnie ewaluowani symulatorem." value={searchBayes} min={0} max={18} step={1} onChange={setSearchBayes} display={String(searchBayes)} />
-              <Slider label="Limit autopilota" hint="Maksymalna liczba kolejnych sugerowanych przebiegów; kolejne runy mogą potwierdzać stabilność bez zmiany parametrów" tooltip="Autopilot: runₖ → interpretacjaₖ → parametryₖ₊₁ → seedₖ₊₁ → runₖ₊₁. Limit zatrzymuje pętlę po wskazanej liczbie przebiegów." value={autoRunLimit} min={1} max={MAX_AUTOPILOT_RUN_LIMIT} step={1} onChange={setAutoRunLimit} display={String(autoRunLimit)} />
+              <Slider label="Limit autopilota" hint="Maksymalna liczba kolejnych sugerowanych przebiegów w jednej serii; historia wyników nie jest ucinana" tooltip="Autopilot: runₖ → interpretacjaₖ → parametryₖ₊₁ → seedₖ₊₁ → runₖ₊₁. Limit zatrzymuje bieżącą serię po wskazanej liczbie przebiegów; archiwum zbiera wszystkie przebiegi z sesji." value={autoRunLimit} min={1} max={MAX_AUTOPILOT_BATCH_LIMIT} step={1} onChange={setAutoRunLimit} display={String(autoRunLimit)} />
               <div style={{ fontSize: 12, color: "#94949e", lineHeight: 1.6 }}>
                 Szacowana liczba ewaluacji konfiguracji: <strong style={{ color: "#fff" }}>{estimatedEvaluations}</strong>.
                 Każda ewaluacja to <strong style={{ color: "#fff" }}>{reps}</strong> repetycji. Dla validated i redesign obowiązuje polityka <strong style={{ color: "#fff" }}>S ≥ {MIN_VALIDATED_FRACTIONS}</strong>.
-                Aktualne seedy: <strong style={{ color: "#fff" }}>{seedBase}</strong> / <strong style={{ color: "#fff" }}>{seedSearch}</strong>.
+                Aktualne ziarna losowości: <strong style={{ color: "#fff" }}>seedBase={seedBase}</strong> / <strong style={{ color: "#fff" }}>seedSearch={seedSearch}</strong>.
               </div>
             </Box>
 
             <ParameterHints />
 
             <Box accent={busy ? "#8b7cf640" : "#33333b"}>
-              <Label>Status</Label>
+              <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "baseline" }}>
+                <Label>Status</Label>
+                <HelpLink href="/help#workflow">pipeline</HelpLink>
+              </div>
               <div style={{ fontSize: 13, color: "#fff", marginBottom: 6 }}>{phase}</div>
               <div style={{ fontSize: 12, color: "#8e8e98", lineHeight: 1.6 }}>
-                Pipeline: walidacja silnika → RTZ v1.0 legacy → RTZ v1.1 validated → search v2.0 z Bayesian-lite → ablacja → krzywa uczenia → eksport.
+                Pipeline: walidacja silnika → RTZ v1.0 legacy → RTZ v1.1 validated → search v2.1 z Bayesian-lite i bramką RR → ablacja → krzywa uczenia → eksport.
               </div>
             </Box>
 
@@ -2141,19 +2658,26 @@ export default function App() {
           <div style={{ display: "grid", gap: 12 }}>
             {!data && !busy ? (
               <Box>
-                <Label>Co się zmieniło</Label>
+                <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "baseline" }}>
+                  <Label>Co się zmieniło</Label>
+                  <HelpLink href="/help#versions">wersje RTZ</HelpLink>
+                </div>
                 <div style={{ fontSize: 14, color: "#d6d6dd", lineHeight: 1.75 }}>
-                  <div>• zachowany historyczny mechanizm <strong>RTZ v1.0 legacy</strong>,</div>
-                  <div>• dodany <strong>RTZ v1.1 validated</strong> z alokacją budżetowo wykonalną i polityką S ≥ 1000,</div>
-                  <div>• FI liczony tylko dla rynku rzeczywistego, bez <strong>Red Teamu</strong>,</div>
-                  <div>• przebudowany redesign v2.0 z fairness-aware selection, Bayesian-lite/TPE search, Pareto frontem i eksportem do artykułu.</div>
+                  <div>• v1.0 odtwarza historyczną logikę oryginalnego algorytmu, w tym jego ograniczenia implementacyjne,</div>
+                  <div>• v1.1 wprowadza walidację budżetów, reguły clearingu i minimalnej granularności S ≥ 1000,</div>
+                  <div>• v2.1 rozdziela best feasible od best trade-off: rekomendacją jest tylko kandydat z RR ≥ 90%, a trade-off zostaje diagnostyką,</div>
+                  <div>• adaptive pozostaje w searchu, ale dostaje karę ryzyka w rankingu v2.1, bo w poprzednich przebiegach często podbijał FI kosztem RR,</div>
+                  <div>• Bayesian-lite proponuje kandydatów na podstawie historii wyników, a każdy kandydat jest następnie oceniany pełną symulacją.</div>
                 </div>
               </Box>
             ) : null}
 
             {busy ? (
               <Box accent="#8b7cf640">
-                <Label>Uruchomienie</Label>
+                <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "baseline" }}>
+                  <Label>Uruchomienie</Label>
+                  <HelpLink href="/help#workflow">co teraz liczy?</HelpLink>
+                </div>
                 <div style={{ fontSize: 18, fontWeight: 700, color: "#fff", marginBottom: 8 }}>{phase}</div>
                 <div style={{ fontSize: 12, color: "#90909a", lineHeight: 1.7 }}>
                   Aplikacja działa asynchronicznie, więc status odświeża się między kolejnymi blokami obliczeń.
@@ -2161,9 +2685,9 @@ export default function App() {
               </Box>
             ) : null}
 
-            <ExperimentHistory rows={history} />
+            {data ? <Results data={data} archive={runArchive} onApplyParams={handleApplyParams} onApplyAndRun={handleApplyAndRun} onAutoRun={handleAutoRun} autoRunLimit={autoRunLimit} /> : null}
 
-            {data ? <Results data={data} onApplyParams={handleApplyParams} onApplyAndRun={handleApplyAndRun} onAutoRun={handleAutoRun} autoRunLimit={autoRunLimit} /> : null}
+            <ExperimentHistory entries={runArchive} />
           </div>
         </div>
       </div>

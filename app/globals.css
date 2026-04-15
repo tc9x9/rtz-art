@@ -21,3 +21,34 @@ input {
 button:disabled {
   cursor: not-allowed;
 }
+
+.rtz-hero-grid {
+  grid-template-columns: minmax(0, 1fr) minmax(300px, 420px);
+}
+
+.rtz-hero-cards {
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+}
+
+.rtz-quick-panel {
+  width: 100%;
+  max-width: 420px;
+  justify-self: end;
+}
+
+@media (min-width: 1020px) {
+  .rtz-hero-cards {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 900px) {
+  .rtz-hero-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .rtz-quick-panel {
+    max-width: none;
+    justify-self: stretch;
+  }
+}
