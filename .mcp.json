@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "rtz-params": {
+      "command": "node",
+      "args": ["/Users/tc/projects/rtz-art/mcp/rtz-params-server.mjs"]
+    }
+  }
+}

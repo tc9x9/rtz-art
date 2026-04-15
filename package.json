@@ -1,0 +1,25 @@
+{
+  "name": "rtz-auction-lab",
+  "version": "0.1.0",
+  "private": true,
+  "description": "RTZ Auction Lab: validated simulator and fairness-aware redesign for fractionalized copyright auctions.",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "mcp:params": "node mcp/rtz-params-server.mjs",
+    "typecheck": "tsc --noEmit",
+    "check": "npm run typecheck"
+  },
+  "dependencies": {
+    "next": "^15.0.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "typescript": "^5.6.0"
+  }
+}

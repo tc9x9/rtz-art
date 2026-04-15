@@ -1,0 +1,12 @@
+{
+  "nAgents": 30,
+  "tv": 50000,
+  "roundsLearn": 160,
+  "roundsEval": 80,
+  "reps": 9,
+  "searchExplore": 10,
+  "searchExploit": 14,
+  "searchBayes": 6,
+  "seedBase": 1000,
+  "seedSearch": 424242
+}
